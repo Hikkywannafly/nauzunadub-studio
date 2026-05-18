@@ -45,7 +45,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
   const translateQuality = useAppStore(s => s.translateQuality);
   const glossaryTerms   = useAppStore(s => s.glossaryTerms);
 
-  const [translateProvider, setTranslateProvider] = useState('argos');
+  const [translateProvider, setTranslateProvider] = useState('openai');
   const [showTranscript, setShowTranscript] = useState(false);
   const [previewAudios, setPreviewAudios] = useState({});
   const [transcribeStart, setTranscribeStart] = useState(null);

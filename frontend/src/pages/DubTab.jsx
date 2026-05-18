@@ -731,12 +731,9 @@ export default function DubTab(props) {
                       )}
                     </div>
                     <select className="input-base dub-engine-select" value={translateProvider} onChange={e => setTranslateProvider(e.target.value)}>
-                      {(engines.length ? engines : [
-                        { id: 'argos', display_name: 'Argos (Fast Local)', installed: true },
-                        { id: 'nllb', display_name: 'NLLB (Heavy Local)', installed: true },
-                        { id: 'google', display_name: 'Google (Online)', installed: true },
-                        { id: 'openai', display_name: 'OpenAI (LLM)', installed: true },
-                      ]).map(p => (
+                      {/* Chỉ giữ LLM provider — argos/google/nllb đã loại bỏ vì
+                          chất lượng dub kém hơn. LLM (OpenAI-compatible) là default. */}
+                      {[{ id: 'openai', display_name: 'LLM (OpenAI-compatible)', installed: true }].map(p => (
                         <option key={p.id} value={p.id}>
                           {p.installed ? p.display_name : `${p.display_name} — needs install`}
                         </option>
