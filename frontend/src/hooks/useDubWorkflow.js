@@ -46,6 +46,8 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
   const glossaryTerms   = useAppStore(s => s.glossaryTerms);
 
   const [translateProvider, setTranslateProvider] = useState('openai');
+  const [translateGenre, setTranslateGenre] = useState('');  // '' = no preset, dùng prompt base
+  const [audioProfile, setAudioProfile] = useState('broadcast');  // cinematic|broadcast|voiceover|natural
   const [showTranscript, setShowTranscript] = useState(false);
   const [previewAudios, setPreviewAudios] = useState({});
   const [transcribeStart, setTranscribeStart] = useState(null);
@@ -286,6 +288,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
         target_lang: dubLangCode,
         provider: translateProvider,
         quality: translateQuality,
+        genre: translateGenre || undefined,
         glossary: glossaryTerms.length
           ? glossaryTerms.map(t => ({ source: t.source, target: t.target, note: t.note || '' }))
           : undefined,
@@ -339,6 +342,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
         instruct: dubInstruct,
         num_step: steps, guidance_scale: cfg, speed,
         preview,
+        audio_profile: audioProfile,
       };
       const data = await dubGenerate(dubJobId, body);
       setDubTaskId(data.task_id);
@@ -409,6 +413,8 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
 
   return {
     translateProvider, setTranslateProvider,
+    translateGenre, setTranslateGenre,
+    audioProfile, setAudioProfile,
     showTranscript, setShowTranscript,
     previewAudios, setPreviewAudios,
     transcribeElapsed,

@@ -288,6 +288,8 @@ function App() {
 
   const {
     translateProvider, setTranslateProvider,
+    translateGenre, setTranslateGenre,
+    audioProfile, setAudioProfile,
     showTranscript, setShowTranscript,
     previewAudios, setPreviewAudios,
     transcribeElapsed,
@@ -960,6 +962,8 @@ function App() {
               dubLocalBlobUrl={dubLocalBlobUrl}
               transcribeElapsed={transcribeElapsed}
               translateProvider={translateProvider} setTranslateProvider={setTranslateProvider}
+              translateGenre={translateGenre} setTranslateGenre={setTranslateGenre}
+              audioProfile={audioProfile} setAudioProfile={setAudioProfile}
               onGlossaryChange={setGlossaryTerms}
               showTranscript={showTranscript} setShowTranscript={setShowTranscript}
               profiles={profiles}

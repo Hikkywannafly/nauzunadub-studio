@@ -2,6 +2,7 @@ import os
 import uuid
 import time
 import shutil
+import logging
 from typing import Optional
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse, Response
@@ -51,6 +52,42 @@ async def create_profile(
 
     with open(audio_path, "wb") as f:
         f.write(await ref_audio.read())
+
+    # Auto-trim reference audio xuống ≤15s. OmniVoice TTS chậm tuyến tính theo
+    # độ dài reference — file 8 phút làm reference → mỗi segment chậm 20-30×.
+    # User upload nguyên video/audio dài qua nút CAST 📤 sẽ rơi vào case này.
+    # Cắt 10s đầu là đủ cho voice cloning, file gốc trên disk được ghi đè.
+    _MAX_REF_S = 15.0
+    _TRIM_TO_S = 10.0
+    try:
+        import soundfile as sf
+        info = sf.info(audio_path)
+        dur = info.frames / float(info.samplerate)
+        if dur > _MAX_REF_S:
+            # Đọc bằng ffmpeg để hỗ trợ mọi format (mp4, m4a, webm…)
+            import subprocess
+            from services.ffmpeg_utils import find_ffmpeg
+            ff = find_ffmpeg()
+            if ff:
+                trimmed_path = audio_path + ".trim.wav"
+                subprocess.run(
+                    [ff, "-y", "-i", audio_path, "-t", str(_TRIM_TO_S),
+                     "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
+                     trimmed_path],
+                    check=True, capture_output=True, timeout=30,
+                )
+                os.replace(trimmed_path, audio_path)
+                logger = logging.getLogger("omnivoice.profiles")
+                logger.info(
+                    "Auto-trimmed ref_audio of profile %s from %.1fs to %.1fs",
+                    profile_id, dur, _TRIM_TO_S,
+                )
+    except Exception as _trim_err:
+        # Trim fail là non-fatal — file gốc vẫn dùng được, chỉ là chậm.
+        logging.getLogger("omnivoice.profiles").warning(
+            "Auto-trim ref_audio failed for profile %s: %s (giữ file gốc)",
+            profile_id, _trim_err,
+        )
 
     try:
         with db_conn() as conn:

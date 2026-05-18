@@ -160,6 +160,13 @@ def _unload_nllb():
         pass
 
 
+@router.get("/api/genres")
+async def list_translation_genres():
+    """Danh sách preset thể loại cho dropdown Genre trong UI."""
+    from services.translation_genres import list_genres
+    return {"genres": list_genres()}
+
+
 @router.post("/dub/translate")
 async def dub_translate(req: TranslateRequest):
     try:
@@ -265,6 +272,10 @@ async def dub_translate(req: TranslateRequest):
             from openai import OpenAI
             client = OpenAI(base_url=base_url, api_key=effective_key or "local")
 
+            # Lấy genre prompt extra (string rỗng nếu không pick)
+            from services.translation_genres import get_genre_prompt
+            genre_extra = get_genre_prompt(getattr(req, "genre", None))
+
             def _build_prompt(src_code: str, tgt_code: str) -> str:
                 """Build a system prompt that resists hallucinations on small
                 local LLMs. Three things matter:
@@ -289,13 +300,16 @@ async def dub_translate(req: TranslateRequest):
                         f"only — do not use Latin/Roman letters, do not "
                         f"transliterate, do not output any other language."
                     )
-                return (
+                base = (
                     f"You are a professional dubbing translator. "
                     f"Translate the user's text from {src_name} into "
                     f"{tgt_name}.{script_clause} "
                     f"Reply ONLY with the translated {tgt_name} text, do not "
                     f"add quotes, notes, headers, explanations, or commentary."
                 )
+                if genre_extra:
+                    base = base + " " + genre_extra
+                return base
 
             def _call_once(seg, sys_for_attempt):
                 """Một lần gọi LLM thuần (blocking). Caller xử lý retry / sem."""

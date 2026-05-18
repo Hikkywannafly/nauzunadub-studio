@@ -462,11 +462,106 @@ def segment_transcript(
     return [s.to_dict() for s in segments]
 
 
+def _normalize_spk_label(raw: str) -> str:
+    """`SPEAKER_00` → `Speaker 1`. Idempotent với label đã đẹp."""
+    try:
+        idx = int(raw.split("_")[-1]) + 1
+        return f"Speaker {idx}"
+    except (ValueError, IndexError):
+        return raw
+
+
+def _split_segment_by_speaker_turns(seg: dict, diarization, min_turn_dur: float = 0.6) -> List[dict]:
+    """Tách 1 WhisperX segment thành nhiều phần khi bên trong có nhiều speaker.
+
+    Dùng Pyannote turn boundaries để xác định điểm cắt. Word-level timestamps
+    (nếu có trong `seg["words"]`) được chia về sub-segment theo timestamp.
+    Nếu chỉ có 1 speaker hoặc segment quá ngắn → trả nguyên list 1 phần tử.
+
+    `min_turn_dur`: turn nhỏ hơn này coi như nhiễu, gộp vào turn lân cận.
+    """
+    start, end = seg["start"], seg["end"]
+    # Gom tất cả turn overlap với segment này, sort theo start.
+    turns = []
+    for turn, _, spk in diarization.itertracks(yield_label=True):
+        left = max(start, turn.start)
+        right = min(end, turn.end)
+        if right - left >= min_turn_dur:
+            turns.append((left, right, spk))
+    turns.sort(key=lambda t: t[0])
+
+    # Gộp các turn liên tiếp cùng speaker
+    merged = []
+    for t_start, t_end, spk in turns:
+        if merged and merged[-1][2] == spk and t_start - merged[-1][1] < 0.3:
+            merged[-1] = (merged[-1][0], t_end, spk)
+        else:
+            merged.append((t_start, t_end, spk))
+
+    if len(merged) <= 1:
+        return [seg]
+
+    # Có >=2 speakers. Cắt segment theo word timestamp nếu có.
+    words = seg.get("words") or []
+    text = seg.get("text", "")
+    out = []
+    for i, (t_start, t_end, spk) in enumerate(merged):
+        # Mở rộng biên đầu/cuối để khớp boundary nguồn
+        sub_start = start if i == 0 else t_start
+        sub_end = end if i == len(merged) - 1 else t_end
+        if words:
+            sub_words = [w for w in words if w.get("start", 0) >= t_start - 0.1 and w.get("end", 0) <= t_end + 0.1]
+            sub_text = " ".join(w.get("word", w.get("text", "")) for w in sub_words).strip()
+            if not sub_text:
+                # Fallback: chia theo tỷ lệ thời gian
+                ratio_start = (t_start - start) / max(end - start, 0.01)
+                ratio_end = (t_end - start) / max(end - start, 0.01)
+                sub_text = text[int(len(text) * ratio_start):int(len(text) * ratio_end)].strip() or text
+        else:
+            ratio_start = (t_start - start) / max(end - start, 0.01)
+            ratio_end = (t_end - start) / max(end - start, 0.01)
+            sub_text = text[int(len(text) * ratio_start):int(len(text) * ratio_end)].strip() or text
+
+        new_seg = dict(seg)
+        new_seg["start"] = round(sub_start, 3)
+        new_seg["end"] = round(sub_end, 3)
+        new_seg["text"] = sub_text
+        new_seg["speaker_id"] = _normalize_spk_label(spk)
+        new_seg.pop("id", None)  # mới tạo, sẽ được re-id ở caller
+        # Text đã đổi → mọi field downstream phụ thuộc text gốc đều stale.
+        # Nếu giữ lại, mọi sub-segment chia sẻ cùng bản dịch / TTS audio của
+        # segment cha → nội dung trùng nhau, sai nhân vật.
+        for _stale_key in ("translation", "tts_audio", "dub_audio_path", "preview_audio"):
+            new_seg.pop(_stale_key, None)
+        if words:
+            new_seg["words"] = sub_words
+        out.append(new_seg)
+    return out
+
+
 def assign_speakers_from_diarization(
     segments: List[dict],
     diarization,
+    split_multi_speaker: bool = True,
 ) -> List[dict]:
-    """Replace speaker_id based on a pyannote diarization result (overlap-weighted)."""
+    """Replace speaker_id based on pyannote diarization (overlap-weighted).
+
+    Nếu `split_multi_speaker=True` (default), segment chứa nhiều speakers sẽ
+    được TÁCH thành nhiều sub-segment theo turn boundaries của Pyannote.
+    Trước đây code chỉ gán 1 speaker/segment dù bên trong có 2 người → 2 lời
+    thoại của 2 nhân vật bị merge vào 1 đoạn text.
+    """
+    if split_multi_speaker:
+        expanded: List[dict] = []
+        for s in segments:
+            parts = _split_segment_by_speaker_turns(s, diarization)
+            expanded.extend(parts)
+        # Re-id sequentially
+        for i, s in enumerate(expanded):
+            s["id"] = i
+        return expanded
+
+    # Legacy path: chỉ gán speaker, không split
     for s in segments:
         start, end = s["start"], s["end"]
         mid = (start + end) / 2.0
@@ -479,18 +574,13 @@ def assign_speakers_from_diarization(
         if overlap:
             winner = max(overlap.items(), key=lambda kv: kv[1])[0]
         else:
-            # fall back to midpoint membership
             winner = None
             for turn, _, speaker in diarization.itertracks(yield_label=True):
                 if turn.start <= mid <= turn.end:
                     winner = speaker
                     break
         if winner is not None:
-            try:
-                idx = int(winner.split("_")[-1]) + 1
-                s["speaker_id"] = f"Speaker {idx}"
-            except ValueError:
-                s["speaker_id"] = winner
+            s["speaker_id"] = _normalize_spk_label(winner)
     return segments
 
 

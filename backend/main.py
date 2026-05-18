@@ -97,6 +97,13 @@ logging.basicConfig(
 )
 logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# Pyannote/Lightning spam cảnh báo version mismatch mỗi lần load checkpoint
+# VAD — checkpoint cũ vẫn work cho inference, không cần spam.
+logging.getLogger("pytorch_lightning.utilities.migration.utils").setLevel(logging.ERROR)
+logging.getLogger("pyannote.audio.utils.version").setLevel(logging.ERROR)
+import warnings as _warnings
+_warnings.filterwarnings("ignore", message=".*Model was trained with.*")
+_warnings.filterwarnings("ignore", message=".*pyannote.audio.*")
 
 from core.config import LOG_PATH, CRASH_LOG_PATH, OUTPUTS_DIR, VOICES_DIR
 

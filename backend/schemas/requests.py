@@ -48,6 +48,10 @@ class DubRequest(BaseModel):
     #   "trim"         — hard-clip to slot length + fade out (cheap, may cut mid-word).
     #   "off"          — no fit; mix layers with += (legacy behaviour, may overlap).
     slot_fit: Optional[str] = "time_stretch"
+    # Audio post-processing profile: cinematic | broadcast | voiceover | natural.
+    # Quyết định compressor strength + RMS-normalize target để giọng dub khớp
+    # loại content (phim/podcast/narrator/raw). Xem services/audio_dsp.py.
+    audio_profile: Optional[str] = "broadcast"
 
 class TranslateSegment(BaseModel):
     id: str
@@ -62,6 +66,7 @@ class TranslateRequest(BaseModel):
     job_id: Optional[str] = None  # Dub job id, used to resolve detected source_lang
     quality: Optional[str] = "fast"  # "fast" (one-shot) | "cinematic" (reflect → adapt)
     glossary: Optional[List[dict]] = None  # [{"source": "...", "target": "...", "note": "..."}]
+    genre: Optional[str] = None  # Translation style preset key: services/translation_genres.py
 
 class DubIngestUrlRequest(BaseModel):
     url: str

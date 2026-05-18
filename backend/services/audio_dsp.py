@@ -98,15 +98,88 @@ def get_effect_chain(preset_id: str) -> list[dict]:
 # ── Core DSP functions ──────────────────────────────────────────────────
 
 
-def apply_mastering(audio_tensor, sample_rate=24000):
-    """Applies professional Broadcast-grade DSP (EQ, Compressor, light Reverb) to the clone voice."""
+# ── Audio profile presets ─────────────────────────────────────────────────
+# Mỗi profile = bộ tham số DSP + normalize phù hợp 1 loại content.
+# - cinematic   : drama/phim — giữ dynamic range (whisper vs shout)
+# - broadcast   : vlog/postcast — đều như phát sóng, compress vừa phải
+# - voiceover   : narrator/tutorial — phẳng, ổn định nhất
+# - natural     : raw TTS, không xử lý — user tự post-process sau
+AUDIO_PROFILES = {
+    "cinematic": {
+        "label": "Cinematic (phim drama)",
+        "description": "Giữ dynamic range — whisper vẫn ra whisper, shout vẫn shout",
+        "mastering": {
+            "hpf_hz": 60,
+            "compressor": {"threshold_db": -22, "ratio": 1.2, "attack_ms": 5.0, "release_ms": 200},
+            "reverb": {"room_size": 0.12, "wet_level": 0.06, "dry_level": 0.95},
+        },
+        # RMS target thấp + cap chặt → tôn trọng dynamics tự nhiên
+        "normalize": {"target_dBFS": -16.0, "max_gain_db": 3.0, "min_gain_db": -3.0},
+    },
+    "broadcast": {
+        "label": "Broadcast (vlog / postcast)",
+        "description": "Đều như phát thanh, compress vừa — phù hợp đa số nội dung",
+        "mastering": {
+            "hpf_hz": 60,
+            "compressor": {"threshold_db": -15, "ratio": 2.0, "attack_ms": 2.0, "release_ms": 100},
+            "reverb": {"room_size": 0.10, "wet_level": 0.08, "dry_level": 0.95},
+        },
+        "normalize": {"target_dBFS": -12.0, "max_gain_db": 6.0, "min_gain_db": -6.0},
+    },
+    "voiceover": {
+        "label": "Voiceover (narrator / tutorial)",
+        "description": "Phẳng, ổn định nhất — compress mạnh, mọi câu cùng level",
+        "mastering": {
+            "hpf_hz": 80,
+            "compressor": {"threshold_db": -12, "ratio": 3.0, "attack_ms": 1.0, "release_ms": 80},
+            "reverb": {"room_size": 0.05, "wet_level": 0.04, "dry_level": 0.98},
+        },
+        "normalize": {"target_dBFS": -9.0, "max_gain_db": 10.0, "min_gain_db": -10.0},
+    },
+    "natural": {
+        "label": "Natural (raw, không xử lý)",
+        "description": "Để raw TTS output — user tự post-process sau",
+        "mastering": None,  # skip
+        "normalize": None,  # skip
+    },
+}
+
+
+def get_audio_profile(profile_name: str | None) -> dict:
+    """Lookup profile by name, fallback về broadcast nếu None/invalid."""
+    if not profile_name:
+        return AUDIO_PROFILES["broadcast"]
+    return AUDIO_PROFILES.get(profile_name, AUDIO_PROFILES["broadcast"])
+
+
+def list_audio_profiles() -> list[dict]:
+    """For API endpoint listing profiles cho frontend dropdown."""
+    return [
+        {"id": pid, "label": p["label"], "description": p["description"]}
+        for pid, p in AUDIO_PROFILES.items()
+    ]
+
+
+def apply_mastering(audio_tensor, sample_rate=24000, profile: str | None = None):
+    """Applies DSP (EQ, Compressor, light Reverb) theo profile audio chọn.
+
+    profile=None → fallback "broadcast" (vlog/postcast).
+    profile="natural" → no-op, trả nguyên audio tensor.
+    """
+    cfg = get_audio_profile(profile)
+    m = cfg.get("mastering")
+    if m is None:
+        return audio_tensor  # natural profile: skip mastering
     try:
         from pedalboard import Pedalboard, Compressor, Reverb, HighpassFilter
         import numpy as np
+        comp = m["compressor"]
+        rev = m["reverb"]
         board = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=60),
-            Compressor(threshold_db=-15, ratio=1.5, attack_ms=2.0, release_ms=100),
-            Reverb(room_size=0.10, wet_level=0.08, dry_level=0.95)
+            HighpassFilter(cutoff_frequency_hz=m["hpf_hz"]),
+            Compressor(threshold_db=comp["threshold_db"], ratio=comp["ratio"],
+                       attack_ms=comp["attack_ms"], release_ms=comp["release_ms"]),
+            Reverb(room_size=rev["room_size"], wet_level=rev["wet_level"], dry_level=rev["dry_level"])
         ])
         audio_np = audio_tensor.cpu().numpy()
         if audio_np.ndim == 1:
@@ -120,14 +193,52 @@ def apply_mastering(audio_tensor, sample_rate=24000):
         return audio_tensor
 
 
-def normalize_audio(audio_tensor, target_dBFS=-2.0):
-    """Peak-normalizes the audio to a standard broadcasting level (-2 dB) to fix F5TTS volume fluctuations."""
+def normalize_audio(audio_tensor, target_dBFS=-2.0, profile: str | None = None):
+    """Normalize loudness theo 2 mode:
+
+    - `profile=None` (legacy): peak-normalize tới `target_dBFS` (default -2 dBFS).
+      Giữ nguyên behavior cũ cho callers chưa migrate (gpu_sandbox, batched_tts,
+      tts_stream, openai_compat, generation).
+    - `profile="<name>"`: RMS-based normalize tới target từ profile config, có
+      gain cap ± và soft clip. Dùng cho dub pipeline (DubRequest.audio_profile).
+      `profile="natural"` → no-op.
+    """
     if audio_tensor.numel() == 0:
         return audio_tensor
-    max_val = torch.abs(audio_tensor).max()
-    if max_val > 0:
-        target_amp = 10 ** (target_dBFS / 20.0)
-        audio_tensor = audio_tensor * (target_amp / max_val)
+
+    # Legacy path: peak-normalize. Caller không truyền profile → giữ hành vi cũ
+    # để không phá output của các route khác (TTS stream, OpenAI compat, etc.).
+    if profile is None:
+        max_val = torch.abs(audio_tensor).max()
+        if max_val > 0:
+            target_amp = 10 ** (target_dBFS / 20.0)
+            audio_tensor = audio_tensor * (target_amp / max_val)
+        return audio_tensor
+
+    # Profile-driven RMS path
+    cfg = get_audio_profile(profile)
+    norm_cfg = cfg.get("normalize")
+    if norm_cfg is None:
+        return audio_tensor  # natural: skip normalize
+    target_dBFS = norm_cfg["target_dBFS"]
+    max_gain_db = norm_cfg["max_gain_db"]
+    min_gain_db = norm_cfg["min_gain_db"]
+
+    # RMS đo perceived loudness chính xác hơn peak nhiều.
+    rms = torch.sqrt(torch.mean(audio_tensor ** 2))
+    if rms < 1e-6:
+        return audio_tensor  # silence — không boost noise floor
+    target_amp = 10 ** (target_dBFS / 20.0)
+    gain = target_amp / rms
+    gain = float(torch.clamp(
+        torch.tensor(float(gain)),
+        10 ** (min_gain_db / 20.0),
+        10 ** (max_gain_db / 20.0),
+    ))
+    audio_tensor = audio_tensor * gain
+    # Soft clip phòng peak overshoot sau gain
+    if audio_tensor.abs().max() > 0.98:
+        audio_tensor = torch.tanh(audio_tensor * 0.95) / 0.95
     return audio_tensor
 
 

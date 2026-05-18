@@ -23,6 +23,16 @@ logger = logging.getLogger("omnivoice.dub")
 
 router = APIRouter()
 
+
+@router.get("/api/audio-profiles")
+async def list_audio_profiles_endpoint():
+    """Danh sách audio post-processing profile (cinematic/broadcast/voiceover/natural)
+    — consumed bởi `audio_profile` field trong DubRequest dưới đây.
+    """
+    from services.audio_dsp import list_audio_profiles
+    return {"profiles": list_audio_profiles()}
+
+
 @router.post("/dub/generate/{job_id}")
 async def dub_generate(job_id: str, req: DubRequest):
     """Adds a dub generation job to the async batch task pool."""
@@ -207,8 +217,13 @@ async def dub_generate(job_id: str, req: DubRequest):
                         speed=spd, denoise=True, postprocess_output=True,
                     )
                     audio_out = audios[0]
-                    mastered_audio = apply_mastering(audio_out, sample_rate=_model.sampling_rate if hasattr(_model, 'sampling_rate') else 24000)
-                    return normalize_audio(mastered_audio, target_dBFS=-2.0)
+                    _ap = getattr(req, "audio_profile", None) or "broadcast"
+                    mastered_audio = apply_mastering(
+                        audio_out,
+                        sample_rate=_model.sampling_rate if hasattr(_model, 'sampling_rate') else 24000,
+                        profile=_ap,
+                    )
+                    return normalize_audio(mastered_audio, profile=_ap)
                 except Exception as e:
                     import gc
                     gc.collect()
@@ -512,11 +527,14 @@ async def preview_segment(job_id: str, req: SegmentPreviewRequest):
             postprocess_output=True,
         )
         audio_out = audios[0]
+        # Preview chỉ render 1 đoạn để user nghe thử nhanh → hardcode broadcast
+        # (đa số content phù hợp). Full render dùng audio_profile từ DubRequest.
         mastered = apply_mastering(
             audio_out,
             sample_rate=getattr(_model, "sampling_rate", 24000),
+            profile="broadcast",
         )
-        return normalize_audio(mastered, target_dBFS=-2.0)
+        return normalize_audio(mastered, profile="broadcast")
 
     loop = asyncio.get_running_loop()
     audio_tensor = await loop.run_in_executor(_gpu_pool, _gen)
