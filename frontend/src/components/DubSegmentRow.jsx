@@ -1,12 +1,13 @@
-import React, { memo, useRef } from 'react';
+import React, { memo, useMemo, useRef } from 'react';
 import {
   CheckCircle, AlertCircle, Circle, Trash2, Loader, Headphones, Scissors, Merge,
-  MoreHorizontal, Sparkles,
+  MoreHorizontal, Sparkles, Scissors as ScissorsIcon,
 } from 'lucide-react';
 import { formatTime } from '../utils/format';
 import { LANG_CODES } from '../utils/languages';
 import { PRESETS } from '../utils/constants';
 import { Menu, Button, Badge } from '../ui';
+import { rateRatio as computeRateRatio, severityTier } from '../api/segmentRate';
 import './DubSegmentRow.css';
 
 const CHAR_BUDGET_RATIO = 1.3;
@@ -44,12 +45,37 @@ function parseTime(s) {
 function DubSegmentRow({
   seg, idx, style, disabled, isActive, isDone, previewLoading, selected,
   profiles, speakerClones, onEditField, onDelete, onRestore, onPreview, onSelect, onSplit, onMerge, canMerge,
-  onDirect, onSeek,
+  onDirect, onSeek, onShorten, dubLangCode, shorteningId,
 }) {
   const textInputRef = useRef(null);
   const lastCursorRef = useRef(null);
   const speakerOptions = speakerClones ? Object.keys(speakerClones) : [];
   const speakerListId = `seg-speakers-${seg.id}`;
+
+  // Pre-TTS read-speed warning — tính local theo char count vs slot duration.
+  // Cùng công thức + threshold với backend services/speech_rate.py để badge
+  // và LLM shorten dùng chung 1 sự thật. Backend recompute lại khi shorten.
+  const slotSeconds = Math.max(0, (seg.end ?? 0) - (seg.start ?? 0));
+  const fitLang = (seg.target_lang || dubLangCode || 'vi').toLowerCase();
+  const liveRatio = useMemo(
+    () => computeRateRatio(seg.text || '', slotSeconds, fitLang),
+    [seg.text, slotSeconds, fitLang],
+  );
+  const liveSeverity = severityTier(liveRatio);
+  const showFitBadge = liveSeverity !== 'ok' && (seg.text || '').trim().length > 0 && slotSeconds > 0;
+  const fitBadgeColor = liveSeverity === 'critical' ? '#fb4934'
+    : liveSeverity === 'warn' ? '#fabd2f'
+    : '#83a598'; // 'short'
+  const fitBadgeIcon = liveSeverity === 'critical' ? '🔴'
+    : liveSeverity === 'warn' ? '⚠️'
+    : '🔵';
+  const fitBadgeTitle = liveSeverity === 'critical'
+    ? `Vượt slot ${Math.round((liveRatio - 1) * 100)}% — sẽ bị time-stretch / trim. Click ✂️ Shorten để LLM rút gọn.`
+    : liveSeverity === 'warn'
+      ? `Hơi gấp ${Math.round((liveRatio - 1) * 100)}% — vẫn fit được nhưng đọc nhanh hơn. Click ✂️ Shorten nếu muốn thư thả.`
+      : `Quá ngắn (${Math.round(liveRatio * 100)}% slot) — TTS sẽ có khoảng lặng dài cuối câu.`;
+  const isShortening = shorteningId === seg.id;
+  const canShorten = !!onShorten && liveSeverity !== 'ok' && liveSeverity !== 'short' && !disabled;
   const syncColor = seg.sync_ratio === undefined ? null
     : (seg.sync_ratio >= 0.95 && seg.sync_ratio <= 1.05) ? '#b8bb26'
     : seg.sync_ratio > 1.25 ? '#fb4934'
@@ -148,6 +174,15 @@ function DubSegmentRow({
             title={`Speech-rate fit: ${seg.rate_ratio.toFixed(2)}× relative to slot${seg.rate_error ? ` (${seg.rate_error})` : ''}`}
           >
             📖 {seg.rate_ratio.toFixed(2)}×
+          </span>
+        )}
+        {showFitBadge && (
+          <span
+            className={`seg-fit-badge seg-fit-badge--${liveSeverity}`}
+            style={{ color: fitBadgeColor }}
+            title={fitBadgeTitle}
+          >
+            {fitBadgeIcon} {liveRatio.toFixed(2)}×
           </span>
         )}
       </span>
@@ -283,6 +318,19 @@ function DubSegmentRow({
               label: seg.direction ? 'Edit direction…' : 'Set direction…',
               icon: Sparkles,
               onSelect: () => onDirect?.(seg),
+            },
+            {
+              id: 'shorten',
+              label: isShortening
+                ? 'Shortening…'
+                : liveSeverity === 'critical'
+                  ? `✂️ Shorten (vượt ${Math.round((liveRatio - 1) * 100)}%)`
+                  : liveSeverity === 'warn'
+                    ? `✂️ Shorten (gấp ${Math.round((liveRatio - 1) * 100)}%)`
+                    : '✂️ Shorten',
+              icon: ScissorsIcon,
+              disabled: !canShorten || isShortening,
+              onSelect: () => onShorten?.(seg),
             },
             'separator',
             {

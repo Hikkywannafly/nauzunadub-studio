@@ -208,6 +208,50 @@ export default function DubTab(props) {
     input.click();
   }, [dubSegments, setDubSegments]);
 
+  // LLM rút gọn 1 segment cho vừa slot, giữ tone genre. Backend recompute
+  // ratio sau rút — nếu vẫn vượt (vd text gốc dài kinh khủng) thì toast nói
+  // rõ "vẫn còn vượt X%" để user biết phải split/edit thủ công.
+  const [shorteningSegId, setShorteningSegId] = useState(null);
+  const handleSegmentShorten = useCallback(async (seg) => {
+    if (!seg) return;
+    const slot = Math.max(0, (seg.end ?? 0) - (seg.start ?? 0));
+    if (slot <= 0) {
+      toast.error('Segment không có thời lượng — không rút gọn được.');
+      return;
+    }
+    setShorteningSegId(seg.id);
+    try {
+      const { shortenSegment } = await import('../api/segmentRate');
+      const res = await shortenSegment({
+        text: seg.text || '',
+        slot_seconds: slot,
+        target_lang: (seg.target_lang || dubLangCode || 'vi').toLowerCase(),
+        source_text: seg.text_original || undefined,
+        genre_id: translateGenre || undefined,
+      });
+      if (res.error === 'no-llm') {
+        toast.error('Chưa cấu hình LLM — vào Settings → LLM để bật.');
+        return;
+      }
+      if (!res.text || res.text === seg.text) {
+        toast(`LLM không rút thêm được. Vẫn ${res.rate_ratio.toFixed(2)}× slot. Thử Split hoặc edit tay.`, { icon: 'ℹ️' });
+        return;
+      }
+      segmentEditField(seg.id, 'text', res.text);
+      // Show recomputed severity in toast so user thấy có vẫn vượt không.
+      const msg = res.severity === 'ok'
+        ? `✓ Đã rút (${res.old_rate_ratio.toFixed(2)}× → ${res.rate_ratio.toFixed(2)}×, ${res.attempts} lần thử)`
+        : res.severity === 'warn'
+          ? `⚠️ Đã rút nhưng vẫn hơi gấp (${res.old_rate_ratio.toFixed(2)}× → ${res.rate_ratio.toFixed(2)}×)`
+          : `🔴 Đã rút nhưng vẫn vượt (${res.old_rate_ratio.toFixed(2)}× → ${res.rate_ratio.toFixed(2)}×) — cân nhắc Split`;
+      toast.success(msg);
+    } catch (err) {
+      toast.error(`Shorten thất bại: ${err.message || err}`);
+    } finally {
+      setShorteningSegId(null);
+    }
+  }, [dubLangCode, translateGenre, segmentEditField]);
+
   const activeEngineEntry = engines.find(e => e.id === translateProvider);
   const activeEngineUnavailable = activeEngineEntry && !activeEngineEntry.installed;
   const handleInstallEngine = async (engineId) => {
@@ -1109,6 +1153,9 @@ export default function DubTab(props) {
                   onSplit={segmentSplit}
                   onMerge={segmentMerge}
                   onSeek={seekWaveform}
+                  onShorten={handleSegmentShorten}
+                  dubLangCode={dubLangCode}
+                  shorteningId={shorteningSegId}
                 />
               </Suspense>
             </div>

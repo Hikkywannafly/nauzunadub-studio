@@ -183,6 +183,89 @@ async def reload_translate_skills():
     return {"skills": list_skills(), "count": len(list_skills())}
 
 
+@router.post("/dub/segment/shorten")
+async def shorten_segment(payload: dict):
+    """LLM-rút-gọn 1 segment cho vừa slot, giữ tone genre.
+
+    Input:
+      {
+        "text": "câu cần rút gọn",
+        "slot_seconds": 4.0,         # độ dài slot từ source
+        "target_lang": "vi",
+        "source_text": "câu gốc (optional, cho LLM hiểu nghĩa)",
+        "genre_id": "cdrama_business" # optional, để LLM giữ văn phong
+      }
+
+    Output:
+      {
+        "text": "câu đã rút",
+        "rate_ratio": 1.08,          # ratio mới sau rút
+        "old_rate_ratio": 1.85,      # ratio trước
+        "severity": "ok",            # ok / warn / critical / short
+        "attempts": 2,
+        "error": null
+      }
+
+    Trả mã 200 cả khi rút không thành (text gốc giữ nguyên, error field cho
+    biết lý do — vd "no-llm"). Frontend nên check `text === payload.text` để
+    biết có thay đổi.
+    """
+    from services.speech_rate import (
+        adjust_for_slot, rate_ratio as compute_ratio, severity_tier,
+    )
+
+    text = (payload.get("text") or "").strip()
+    slot = float(payload.get("slot_seconds") or 0.0)
+    target_lang = payload.get("target_lang") or "vi"
+    source_text = payload.get("source_text") or None
+    genre_id = payload.get("genre_id") or None
+
+    if not text:
+        return {"error": "empty text", "text": "", "rate_ratio": 1.0, "severity": "ok"}
+    if slot <= 0:
+        return {"error": "invalid slot_seconds", "text": text, "rate_ratio": 1.0, "severity": "ok"}
+
+    old_ratio = compute_ratio(text, slot, target_lang)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: adjust_for_slot(
+            text,
+            slot_seconds=slot,
+            target_lang=target_lang,
+            source_text=source_text,
+            genre_id=genre_id,
+        ),
+    )
+    new_ratio = result.get("rate_ratio", old_ratio)
+    return {
+        "text": result.get("text", text),
+        "rate_ratio": round(new_ratio, 3),
+        "old_rate_ratio": round(old_ratio, 3),
+        "severity": severity_tier(new_ratio),
+        "old_severity": severity_tier(old_ratio),
+        "attempts": result.get("attempts", 0),
+        "error": result.get("error"),
+    }
+
+
+@router.post("/dub/segment/rate-check")
+async def rate_check_segment(payload: dict):
+    """Tính nhanh ratio + severity cho 1 segment — không gọi LLM.
+
+    Dùng cho frontend hiển thị warning badge sau khi user edit text inline.
+    """
+    from services.speech_rate import rate_ratio as compute_ratio, severity_tier
+
+    text = (payload.get("text") or "").strip()
+    slot = float(payload.get("slot_seconds") or 0.0)
+    target_lang = payload.get("target_lang") or "vi"
+    if not text or slot <= 0:
+        return {"rate_ratio": 1.0, "severity": "ok"}
+    r = compute_ratio(text, slot, target_lang)
+    return {"rate_ratio": round(r, 3), "severity": severity_tier(r)}
+
+
 @router.post("/dub/translate")
 async def dub_translate(req: TranslateRequest):
     try:

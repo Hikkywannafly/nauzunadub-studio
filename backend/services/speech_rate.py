@@ -70,10 +70,14 @@ def adjust_for_slot(
     slot_seconds: float,
     target_lang: str,
     source_text: Optional[str] = None,
+    genre_id: Optional[str] = None,
 ) -> dict:
     """Return `{text, rate_ratio, attempts, error?}`.
 
     Falls back to the input text if the LLM is off or the loop gives up.
+    `genre_id` nối skill prompt (style guide) vào system để LLM giữ tone
+    nhất quán khi trim/expand — không chỉ "ngắn lại" mà "ngắn lại đúng văn
+    phong genre này".
     """
     initial_ratio = rate_ratio(text, slot_seconds, target_lang)
     if TOL_LOW <= initial_ratio <= TOL_HIGH:
@@ -88,6 +92,15 @@ def adjust_for_slot(
             "error": "no-llm",
         }
 
+    # Skill/genre prompt extra — keep tone consistent during trim/expand.
+    genre_extra = ""
+    if genre_id:
+        try:
+            from services.translation_genres import get_genre_prompt
+            genre_extra = get_genre_prompt(genre_id) or ""
+        except Exception:
+            genre_extra = ""
+
     current = text
     best = (current, initial_ratio)
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -95,7 +108,8 @@ def adjust_for_slot(
         if TOL_LOW <= r <= TOL_HIGH:
             return {"text": current, "rate_ratio": r, "attempts": attempt - 1}
 
-        system = _TRIM_PROMPT if r > 1.0 else _EXPAND_PROMPT
+        base_system = _TRIM_PROMPT if r > 1.0 else _EXPAND_PROMPT
+        system = base_system if not genre_extra else f"{base_system}\n\nSTYLE GUIDE:\n{genre_extra}"
         user_lines = [
             f"Target language: {target_lang}",
             f"Slot: {slot_seconds:.2f}s",
@@ -124,6 +138,24 @@ def adjust_for_slot(
         "rate_ratio": best[1],
         "attempts": MAX_ATTEMPTS,
     }
+
+
+# ── Severity tiers — used by frontend warning badges + API responses ─────
+def severity_tier(ratio: float) -> str:
+    """Map ratio → severity bucket.
+
+    - `ok`       : 0.85 ≤ ratio ≤ 1.15 — đọc thoải mái, không cần action
+    - `warn`     : 1.15 < ratio ≤ 1.50 — hơi gấp, sẽ bị time-stretch nhẹ
+    - `critical` : ratio > 1.50         — vượt quá rõ, sẽ bị chipmunk / trim
+    - `short`    : ratio < 0.85         — text quá ngắn, TTS sẽ pause dài
+    """
+    if ratio > 1.50:
+        return "critical"
+    if ratio > 1.15:
+        return "warn"
+    if ratio < 0.85:
+        return "short"
+    return "ok"
 
 
 def adjust_many(pairs: Iterable[tuple[str, float, str, Optional[str]]]) -> list[dict]:
