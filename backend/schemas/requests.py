@@ -57,6 +57,13 @@ class TranslateSegment(BaseModel):
     id: str
     text: str
     target_lang: Optional[str] = None
+    # Slot length (end - start) in seconds. When provided, backend runs a
+    # post-translate LLM fit pass to trim/expand the output so it reads in
+    # roughly this duration — eliminates the "translation too long for slot"
+    # problem that causes TTS to either time-stretch (pitch artifacts) or
+    # clip mid-word at mix time.
+    slot_seconds: Optional[float] = None
+    direction: Optional[str] = None
 
 class TranslateRequest(BaseModel):
     segments: List[TranslateSegment]

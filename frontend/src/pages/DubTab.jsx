@@ -1,6 +1,6 @@
 import React, { Suspense, lazy, useState, useEffect, useCallback } from 'react';
 import {
-  PanelLeftOpen, PanelLeftClose, Film, Save, UploadCloud, Sparkles, Loader, Square,
+  PanelLeftOpen, PanelLeftClose, Film, Save, UploadCloud, Upload, Sparkles, Loader, Square,
   FileText, Play, DownloadIcon, Volume2, Link2,
   Languages, ChevronDown, ChevronUp, Wand2, Trash2, Check, Globe, UserSquare2, User, AlertCircle,
 } from 'lucide-react';
@@ -104,6 +104,12 @@ export default function DubTab(props) {
   // Multi-language mode
   const [multiLangMode, setMultiLangMode] = useState(false);
   const [multiLangs, setMultiLangs] = useState([]);
+
+  // CAST mode override — needed when user clicks "Narrator" before picking a
+  // voice. Without this, the mode is derived from segment profile_ids, and
+  // narrator can't be derived until a voice is actually assigned, so the
+  // button click would visually do nothing. Null = derive from state.
+  const [castModeOverride, setCastModeOverride] = useState(null);
 
   // Live ETA while generating — elapsed ticks each second; remaining is
   // extrapolated from the current/total rate so it's only meaningful once
@@ -650,91 +656,152 @@ export default function DubTab(props) {
                 ) : null}
               />
 
-              {/* Cast — per-speaker voice assignment. When the auto-clone
-                  extractor found a usable passage per speaker (≥5s from the
-                  isolated vocals), that option becomes first-class in the
-                  dropdown. It's also pre-selected on the segments so "new
-                  language = same speaker's voice" works by default.
+              {/* Cast — voice source picker + per-speaker overrides.
+                  Mode quick-actions batch-apply to all speakers; per-speaker
+                  row below lets the user override individuals (which kicks
+                  mode → Custom). Auto-clone refs are extracted from the
+                  Demucs-isolated vocals during prepare (see
+                  services/speaker_clone.py); each `auto:speaker_N` profile_id
+                  resolves back to that per-speaker ref at generate time. */}
+              {dubSegments.some(s => s.speaker_id) && (() => {
+                const speakers = [...new Set(dubSegments.map(s => s.speaker_id).filter(Boolean))];
+                const autoIdFor = (spk) => `auto:${(spk || '').toLowerCase().replace(/\s+/g, '_')}`;
+                const pidOf = (spk) => dubSegments.find(s => s.speaker_id === spk)?.profile_id || '';
+                const pids = speakers.map(pidOf);
 
-                  Narrator mode: dropdown "🎙️ Cùng 1 giọng" áp 1 voice cho TẤT
-                  CẢ speakers — dùng khi user muốn lồng tiếng kiểu 1 narrator
-                  đọc hết phim, không clone giọng từ video. */}
-              {dubSegments.some(s => s.speaker_id) && (
-                <div className="dub-cast">
-                  <div className="dub-cast__row">
-                    <span className="dub-cast__kicker" title="Assign a voice to each detected speaker. Cross-lingual clones keep the same speaker identity in a new language.">CAST</span>
-                    <div className="dub-cast__pair">
-                      <span className="dub-cast__label" title="Áp dụng 1 giọng cho tất cả speaker (chế độ narrator). Bỏ chọn = giữ giọng riêng từng speaker.">🎙️ All:</span>
-                      <select
-                        className="input-base dub-cast__select"
-                        value=""
-                        onChange={e => {
-                          const val = e.target.value;
-                          if (!val) return;
-                          // __default__ là sentinel cho "clear profile_id" — không
-                          // thể dùng "" vì trùng với placeholder option ở trên.
-                          const real = val === '__default__' ? '' : val;
-                          setDubSegments(dubSegments.map(s => s.speaker_id ? { ...s, profile_id: real } : s));
-                          e.target.value = '';
-                        }}
-                      >
-                        <option value="">— Áp 1 giọng cho tất cả —</option>
-                        <option value="__default__">Default (TTS không clone)</option>
-                        {profiles.length > 0 && (
-                          <optgroup label="Clone Profiles">
-                            {profiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                          </optgroup>
-                        )}
-                        {PRESETS.length > 0 && (
-                          <optgroup label="Design Presets (giọng có sẵn)">
-                            {PRESETS.map(p => <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>)}
-                          </optgroup>
-                        )}
-                      </select>
+                // Derive mode from current segment state.
+                const allClone = pids.length > 0 && pids.every(p => p && p.startsWith('auto:'));
+                const allEmpty = pids.length > 0 && pids.every(p => !p);
+                const firstPid = pids[0] || '';
+                const allNarrator = firstPid && !firstPid.startsWith('auto:') && pids.every(p => p === firstPid);
+                const derivedMode = allClone ? 'clone' : allNarrator ? 'narrator' : allEmpty ? 'default' : 'custom';
+                // Override wins until cleared — lets "Narrator" highlight even
+                // before a voice has been picked. Cleared on clone/default
+                // apply (which set a derivable state) and on narrator-voice pick.
+                const castMode = castModeOverride || derivedMode;
+
+                const applyMode = (mode) => {
+                  if (mode === 'clone') {
+                    setDubSegments(dubSegments.map(s => {
+                      if (!s.speaker_id) return s;
+                      const aid = autoIdFor(s.speaker_id);
+                      // Only set if a clone was actually extracted for this speaker;
+                      // otherwise fall back to default so generate doesn't 404 on ref.
+                      return { ...s, profile_id: speakerClones[s.speaker_id] ? aid : '' };
+                    }));
+                    setCastModeOverride(null);
+                  } else if (mode === 'default') {
+                    setDubSegments(dubSegments.map(s => s.speaker_id ? { ...s, profile_id: '' } : s));
+                    setCastModeOverride(null);
+                  } else if (mode === 'narrator') {
+                    // Hold the mode visually while user picks a voice; segment
+                    // state stays untouched until they actually pick something.
+                    setCastModeOverride('narrator');
+                  }
+                };
+
+                const setNarratorVoice = (val) => {
+                  setDubSegments(dubSegments.map(s => s.speaker_id ? { ...s, profile_id: val } : s));
+                  setCastModeOverride(null);
+                };
+
+                return (
+                  <div className="dub-cast">
+                    <div className="dub-cast__row dub-cast__row--mode">
+                      <span className="dub-cast__kicker" title="Voice source for dubbed audio. Clone = keep each speaker's timbre from the original video. Narrator = one voice reads everything. Default = TTS engine's stock voice.">
+                        <Mic2 size={10} /> CAST
+                      </span>
+                      <Segmented
+                        size="sm"
+                        value={castMode === 'custom' ? undefined : castMode}
+                        onChange={applyMode}
+                        items={[
+                          { value: 'clone',    label: '🎤 Clone từ video', title: 'Giữ màu giọng từng speaker từ video gốc (zero-shot voice clone).' },
+                          { value: 'narrator', label: '🎙️ Narrator',      title: 'Một giọng đọc hết phim.' },
+                          { value: 'default',  label: '🔊 Default',        title: 'Giọng mặc định của engine TTS — không clone, không pick.' },
+                        ]}
+                      />
+                      {castMode === 'narrator' && (
+                        <select
+                          className="input-base dub-cast__select dub-cast__select--narrator"
+                          value={firstPid}
+                          onChange={e => setNarratorVoice(e.target.value)}
+                          title="Pick the one voice that reads every line"
+                        >
+                          <option value="" disabled>— Pick a voice —</option>
+                          {profiles.length > 0 && (
+                            <optgroup label="Clone Profiles">
+                              {profiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                            </optgroup>
+                          )}
+                          {PRESETS.length > 0 && (
+                            <optgroup label="Design Presets">
+                              {PRESETS.map(p => <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>)}
+                            </optgroup>
+                          )}
+                        </select>
+                      )}
+                      {castMode === 'custom' && (
+                        <span className="dub-cast__badge" title="Per-speaker voices differ from a single mode. Use the row below to tweak.">Custom</span>
+                      )}
+                      <div className="dub-cast__audio-style" title={audioProfiles.find(a => a.id === audioProfile)?.description || 'Audio post-processing: compress + normalize phù hợp loại content. Cinematic giữ whisper/shout, Broadcast đều, Voiceover phẳng.'}>
+                        <span className="dub-cast__label">Audio Style:</span>
+                        <select
+                          className="input-base dub-cast__audio-style-select"
+                          value={audioProfile}
+                          onChange={e => setAudioProfile(e.target.value)}
+                        >
+                          {audioProfiles.map(a => (
+                            <option key={a.id} value={a.id} title={a.description}>{a.label}</option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
-                    {[...new Set(dubSegments.map(s => s.speaker_id).filter(Boolean))].map(spk => {
-                      const autoId = `auto:${(spk || '').toLowerCase().replace(/\s+/g, '_')}`;
-                      const clone = speakerClones[spk];
-                      const isUploading = uploadingSpeaker === spk;
-                      return (
-                        <div key={spk} className="dub-cast__pair">
-                          <span className="dub-cast__label">{spk}:</span>
-                          <select className="input-base dub-cast__select"
-                            value={dubSegments.find(s => s.speaker_id === spk)?.profile_id || ''}
-                            onChange={e => {
-                              const val = e.target.value;
-                              setDubSegments(dubSegments.map(s => s.speaker_id === spk ? { ...s, profile_id: val } : s));
-                            }}>
-                            {clone && (
-                              <option value={autoId}>🎤 From video · {clone.duration.toFixed(1)}s</option>
-                            )}
-                            <option value="">Default (không clone)</option>
-                            {profiles.length > 0 && (
-                              <optgroup label="Clone Profiles">
-                                {profiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                              </optgroup>
-                            )}
-                            {PRESETS.length > 0 && (
-                              <optgroup label="Design Presets">
-                                {PRESETS.map(p => <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>)}
-                              </optgroup>
-                            )}
-                          </select>
-                          <button
-                            type="button"
-                            className="dub-cast__upload-btn"
-                            title="Upload audio sample 3-30s làm giọng cho speaker này"
-                            disabled={isUploading}
-                            onClick={() => uploadVoiceForSpeaker(spk)}
-                          >
-                            {isUploading ? '⏳' : '📤'}
-                          </button>
-                        </div>
-                      );
-                    })}
+                    <div className="dub-cast__row dub-cast__row--speakers">
+                      {speakers.map(spk => {
+                        const autoId = autoIdFor(spk);
+                        const clone = speakerClones[spk];
+                        const isUploading = uploadingSpeaker === spk;
+                        return (
+                          <div key={spk} className="dub-cast__pair">
+                            <span className="dub-cast__label">{spk}:</span>
+                            <select className="input-base dub-cast__select"
+                              value={pidOf(spk)}
+                              onChange={e => {
+                                const val = e.target.value;
+                                setDubSegments(dubSegments.map(s => s.speaker_id === spk ? { ...s, profile_id: val } : s));
+                              }}>
+                              {clone && (
+                                <option value={autoId}>🎤 From video · {clone.duration.toFixed(1)}s</option>
+                              )}
+                              <option value="">Default (không clone)</option>
+                              {profiles.length > 0 && (
+                                <optgroup label="Clone Profiles">
+                                  {profiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                                </optgroup>
+                              )}
+                              {PRESETS.length > 0 && (
+                                <optgroup label="Design Presets">
+                                  {PRESETS.map(p => <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>)}
+                                </optgroup>
+                              )}
+                            </select>
+                            <button
+                              type="button"
+                              className="dub-cast__upload-btn"
+                              title="Upload audio sample 3-30s làm giọng cho speaker này"
+                              disabled={isUploading}
+                              onClick={() => uploadVoiceForSpeaker(spk)}
+                            >
+                              {isUploading ? <Loader size={11} className="spinner" /> : <Upload size={11} />}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* Translation settings — collapsed or expanded */}
               {!settingsOpen && (
@@ -805,12 +872,13 @@ export default function DubTab(props) {
                   <div className="dub-settings-field dub-settings-field--iso">
                     <div className="label-row">ISO</div>
                     <select
-                      className="input-base dub-cast__select"
+                      className="input-base"
                       value={dubLangCode}
                       onChange={(e) => setDubLangCode(e.target.value)}
+                      title={LANG_CODES.find(lc => lc.code === dubLangCode)?.label || ''}
                     >
                       {LANG_CODES.map(lc => (
-                        <option key={lc.code} value={lc.code}>{lc.code} — {lc.label}</option>
+                        <option key={lc.code} value={lc.code} title={lc.label}>{lc.code}</option>
                       ))}
                     </select>
                   </div>
@@ -855,19 +923,6 @@ export default function DubTab(props) {
                       <option value="">— Mặc định —</option>
                       {genres.map(g => (
                         <option key={g.id} value={g.id} title={g.description}>{g.label}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="dub-settings-field dub-settings-field--audio-profile">
-                    <div className="label-row" title="Audio post-processing: compress + normalize phù hợp loại content. Cinematic giữ whisper/shout, Broadcast đều, Voiceover phẳng.">Audio Style</div>
-                    <select
-                      className="input-base dub-engine-select"
-                      value={audioProfile}
-                      onChange={e => setAudioProfile(e.target.value)}
-                      title={audioProfiles.find(a => a.id === audioProfile)?.description || ''}
-                    >
-                      {audioProfiles.map(a => (
-                        <option key={a.id} value={a.id} title={a.description}>{a.label}</option>
                       ))}
                     </select>
                   </div>

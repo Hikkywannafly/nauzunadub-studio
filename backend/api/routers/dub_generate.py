@@ -23,6 +23,20 @@ logger = logging.getLogger("omnivoice.dub")
 
 router = APIRouter()
 
+# Mix-time fitting constants. Tuned for natural-sounding ends-of-sentences:
+#   * Old behaviour hard-trimmed audio to the slot and applied a 15ms fade,
+#     which clipped the natural breath/tail on the end of every line.
+#   * `_END_FADE_MS = 50` lets the tail decay smoothly — still inaudible if
+#     audio is well below slot end (we trim the silence first via fade math),
+#     audibly softer if we *do* hit a boundary.
+#   * `_TAIL_ALLOWANCE_S = 0.25` lets a segment bleed up to 250ms past its
+#     nominal end ONLY into the gap before the next segment. This keeps the
+#     soft tail of one line from being amputated when the source had room for
+#     it, while still preventing overlap with the next speaker.
+_END_FADE_MS = 50
+_START_FADE_MS = 15  # leading fade stays short — TTS starts cleanly
+_TAIL_ALLOWANCE_S = 0.25
+
 
 @router.get("/api/audio-profiles")
 async def list_audio_profiles_endpoint():
@@ -143,13 +157,8 @@ async def dub_generate(job_id: str, req: DubRequest):
                         if cached_sr != _model.sampling_rate:
                             import torchaudio.functional as AF
                             cached_wav = AF.resample(cached_wav, cached_sr, _model.sampling_rate)
-                        # Pad/trim to slot.
-                        target_samples = int(seg_duration * _model.sampling_rate)
-                        current_samples = cached_wav.shape[-1]
-                        if target_samples > current_samples:
-                            cached_wav = torch.nn.functional.pad(cached_wav, (0, target_samples - current_samples))
-                        elif current_samples > target_samples:
-                            cached_wav = cached_wav[..., :target_samples]
+                        # Keep raw audio length — slot fitting + tail allowance
+                        # are handled uniformly in the mix loop below.
                         all_segment_wavs.append((seg.start, seg.end, cached_wav, _model.sampling_rate))
                         sync_scores.append(getattr(seg, 'sync_ratio', None) or 1.0)
                         _t_cache += time.perf_counter() - _t_cache_0
@@ -164,7 +173,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                 sync_scores.append(1.0)
                 continue
 
-            def _gen(text, lang, instruct_str, dur_s, nstep, cfg, spd, profile_id=None):
+            def _gen(text, lang, instruct_str, nstep, cfg, spd, profile_id=None):
                 ref_audio = None
                 ref_text = None
                 used_seed = None
@@ -209,11 +218,17 @@ async def dub_generate(job_id: str, req: DubRequest):
                     torch.manual_seed(used_seed)
 
                 try:
+                    # No `duration=` here — passing a fixed duration makes the
+                    # model fill any leftover slot time with breath / "ah um"
+                    # filler when the translated text is shorter than the source
+                    # slot. We instead pre-compute `speed` from the text length
+                    # vs slot ratio (see speed-fit block below) so the model
+                    # picks its own natural duration close to the slot.
                     audios = _model.generate(
                         text=text, language=lang if lang != "Auto" else None,
                         ref_audio=ref_audio, ref_text=ref_text,
                         instruct=instruct_str if instruct_str else None,
-                        duration=dur_s, num_step=nstep, guidance_scale=cfg,
+                        num_step=nstep, guidance_scale=cfg,
                         speed=spd, denoise=True, postprocess_output=True,
                     )
                     audio_out = audios[0]
@@ -242,6 +257,23 @@ async def dub_generate(job_id: str, req: DubRequest):
             seg_profile = seg.profile_id or None
             seg_speed = seg.speed if hasattr(seg, 'speed') and seg.speed is not None else req.speed
             seg_lang = seg.target_lang if getattr(seg, 'target_lang', None) else req.language
+
+            # Speed-from-text-length: nudge `speed` so the model's natural
+            # output lands close to the source slot, instead of passing
+            # `duration=` and forcing it to pad with "ah um" filler. Clamp
+            # ±15% — beyond that the speech sounds unnaturally rushed or
+            # sluggish, and any remaining mismatch is better handled by
+            # tail-allowance / time-stretch at mix time.
+            try:
+                from services.speech_rate import expected_duration
+                lang_for_rate = req.language_code or "en"
+                expected_s = expected_duration(seg.text, lang_for_rate)
+                if seg_duration > 0 and expected_s > 0:
+                    slot_factor = expected_s / seg_duration
+                    slot_factor = max(0.85, min(1.25, slot_factor))
+                    seg_speed = (seg_speed or 1.0) * slot_factor
+            except Exception as _e:
+                logger.debug("speed slot-fit skipped for %s: %s", seg_id, _e)
 
             # Phase 4.2 — if the segment carries a free-form direction, parse it
             # and append the taxonomy instruct (e.g. "urgent, surprised") on top
@@ -274,7 +306,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                 _t_tts_0 = time.perf_counter()
                 audio_tensor = await loop.run_in_executor(
                     _gpu_pool, _gen,
-                    seg.text, seg_lang, seg_instruct, seg_duration,
+                    seg.text, seg_lang, seg_instruct,
                     _num_step, req.guidance_scale, seg_speed, seg_profile,
                 )
                 _t_tts += time.perf_counter() - _t_tts_0
@@ -283,19 +315,14 @@ async def dub_generate(job_id: str, req: DubRequest):
                 if task_manager.is_cancelled(task_id):
                     yield f"data: {json.dumps({'type': 'cancelled', 'segments_processed': i + 1})}\n\n"
                     return
-                
-                target_samples = int(seg_duration * _model.sampling_rate)
-                current_samples = audio_tensor.shape[-1]
-                
-                if target_samples > current_samples:
-                    pad_amount = target_samples - current_samples
-                    audio_tensor = torch.nn.functional.pad(audio_tensor, (0, pad_amount))
-                elif current_samples > target_samples:
-                    audio_tensor = audio_tensor[..., :target_samples]
-                    
+
+                # Don't pad or hard-trim here. The mix loop below computes
+                # per-segment tail allowance (how much the audio is allowed
+                # to bleed into the gap before the next seg) and runs the
+                # slot_fit logic uniformly for both fresh and cached audio.
                 generated_dur = audio_tensor.shape[-1] / _model.sampling_rate
                 sync_ratio = round(generated_dur / max(seg_duration, 0.01), 3)
-                
+
                 sync_scores.append(sync_ratio)
 
                 # Build the fingerprint now (cheap) but defer the disk write
@@ -325,13 +352,6 @@ async def dub_generate(job_id: str, req: DubRequest):
                         rvc_wav, rvc_sr = torchaudio.load(seg_wav_path)
                         if rvc_sr == _model.sampling_rate:
                             audio_tensor = rvc_wav
-
-                            target_samples = int(seg_duration * _model.sampling_rate)
-                            current_samples = audio_tensor.shape[-1]
-                            if target_samples > current_samples:
-                                audio_tensor = torch.nn.functional.pad(audio_tensor, (0, target_samples - current_samples))
-                            elif current_samples > target_samples:
-                                audio_tensor = audio_tensor[..., :target_samples]
                     except Exception as e:
                         yield f"data: {json.dumps({'type': 'warning', 'segment': i, 'message': f'RVC skipped: {str(e)[:120]}'})}\n\n"
 
@@ -373,6 +393,16 @@ async def dub_generate(job_id: str, req: DubRequest):
         full_audio = torch.zeros(1, total_samples)
 
         slot_fit = (req.slot_fit or "time_stretch").lower()
+        # Pre-compute each seg's neighbour start so the tail-allowance lookup
+        # below is O(1). Assumes `all_segment_wavs` is in chronological order,
+        # which it always is — segments come from a sorted transcript and we
+        # don't reorder them anywhere upstream. Overlapping neighbours fall
+        # back to gap=0 via the `max(0.0, ...)` clamp later.
+        next_starts = [
+            all_segment_wavs[i + 1][0] if i + 1 < len(all_segment_wavs) else job["duration"]
+            for i in range(len(all_segment_wavs))
+        ]
+
         for i, (start, end, wav, _) in enumerate(all_segment_wavs):
             s = int(start * sr)
             seg_ref = req.segments[i] if i < len(req.segments) else None
@@ -381,36 +411,47 @@ async def dub_generate(job_id: str, req: DubRequest):
             seg_gain = max(0.0, min(2.0, seg_gain))
             adjusted = wav * seg_gain
 
-            # Slot-fit: keep each seg from bleeding into the next. "time_stretch"
-            # resamples to the slot via linear interpolation (slight pitch lift
-            # on compression, negligible at ≤1.15×, audible at ≥1.3×). "trim"
-            # hard-clips + fade-out. "off" is the legacy overlap behaviour.
             slot_samples = int(max(0.0, (end - start)) * sr)
+            # Tail allowance: how far past `end` are we permitted to play
+            # before we'd hit the next segment? Capped at _TAIL_ALLOWANCE_S so
+            # a long silent gap doesn't let one line run on forever.
+            gap_seconds = max(0.0, next_starts[i] - end)
+            tail_seconds = min(_TAIL_ALLOWANCE_S, gap_seconds)
+            allowed_samples = slot_samples + int(tail_seconds * sr)
+
+            # Slot-fit: keep each seg from bleeding past its tail allowance.
+            # "time_stretch" resamples via linear interpolation (slight pitch
+            # lift on compression — negligible at ≤1.15×, audible at ≥1.3×).
+            # "trim" hard-clips + relies on the longer fade-out below to mask
+            # the cut. "off" is the legacy overlap behaviour.
             wl = adjusted.shape[-1]
-            if slot_fit != "off" and slot_samples > 0 and wl > slot_samples:
+            if slot_fit != "off" and allowed_samples > 0 and wl > allowed_samples:
                 if slot_fit == "time_stretch":
                     try:
-                        # Shape: (1, wl) → interpolate(..., size=slot_samples) → (1, slot_samples)
                         adjusted = torch.nn.functional.interpolate(
                             adjusted.unsqueeze(0),
-                            size=slot_samples,
+                            size=allowed_samples,
                             mode='linear',
                             align_corners=False,
                         ).squeeze(0)
                     except Exception as e:
                         logger.warning("time_stretch failed for seg %d, falling back to trim: %s", i, e)
-                        adjusted = adjusted[..., :slot_samples]
+                        adjusted = adjusted[..., :allowed_samples]
                 else:  # "trim"
-                    adjusted = adjusted[..., :slot_samples]
+                    adjusted = adjusted[..., :allowed_samples]
                 wl = adjusted.shape[-1]
 
-            fade_ms = 15
-            fade_samples = int((fade_ms / 1000.0) * sr)
-            if wl > fade_samples * 2:
-                ramp_up = torch.linspace(0, 1, fade_samples, device=adjusted.device)
-                ramp_down = torch.linspace(1, 0, fade_samples, device=adjusted.device)
-                adjusted[0, :fade_samples] *= ramp_up
-                adjusted[0, -fade_samples:] *= ramp_down
+            start_fade = int((_START_FADE_MS / 1000.0) * sr)
+            end_fade = int((_END_FADE_MS / 1000.0) * sr)
+            # Longer end-fade hides any natural-tail trim and softens the
+            # transition into the next seg / background-mix.
+            if wl > start_fade + end_fade:
+                if start_fade > 0:
+                    ramp_up = torch.linspace(0, 1, start_fade, device=adjusted.device)
+                    adjusted[0, :start_fade] *= ramp_up
+                if end_fade > 0:
+                    ramp_down = torch.linspace(1, 0, end_fade, device=adjusted.device)
+                    adjusted[0, -end_fade:] *= ramp_down
 
             e = min(s + wl, total_samples)
             full_audio[:, s:e] += adjusted[:, :e - s]

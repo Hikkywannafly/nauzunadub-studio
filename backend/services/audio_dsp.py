@@ -119,12 +119,16 @@ AUDIO_PROFILES = {
     "broadcast": {
         "label": "Broadcast (vlog / postcast)",
         "description": "Đều như phát thanh, compress vừa — phù hợp đa số nội dung",
+        # Tuned back toward the legacy OmniVoice-Studio settings: lower comp
+        # ratio preserves consonant punch ("k/t/p" stay crisp), louder RMS
+        # target stops the voice sounding far away. Cap is wide enough that
+        # the gain stage actually reaches target on quiet TTS output.
         "mastering": {
             "hpf_hz": 60,
-            "compressor": {"threshold_db": -15, "ratio": 2.0, "attack_ms": 2.0, "release_ms": 100},
+            "compressor": {"threshold_db": -15, "ratio": 1.5, "attack_ms": 2.0, "release_ms": 100},
             "reverb": {"room_size": 0.10, "wet_level": 0.08, "dry_level": 0.95},
         },
-        "normalize": {"target_dBFS": -12.0, "max_gain_db": 6.0, "min_gain_db": -6.0},
+        "normalize": {"target_dBFS": -4.0, "max_gain_db": 12.0, "min_gain_db": -10.0},
     },
     "voiceover": {
         "label": "Voiceover (narrator / tutorial)",

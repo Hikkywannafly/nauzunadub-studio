@@ -334,7 +334,7 @@
 .dub-settings-bar__fields {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 6px;
+  gap: 8px 10px;
   align-items: end;
 }
 .dub-settings-bar__actions {
@@ -364,6 +364,14 @@
   width: 100%;
   font-size: 0.65rem;
   padding: 3px 5px;
+  min-height: 26px;
+  box-sizing: border-box;
+}
+/* Override the global 3px focus glow ring inside settings bar — at this
+   compact size the glow leaks visually into the adjacent column even with
+   normal flex gaps. Border-color change alone reads as focused. */
+.dub-settings-field .input-base:focus {
+  box-shadow: none;
 }
 .dub-settings-field__hint {
   font-size: 0.52rem;
@@ -371,20 +379,24 @@
   font-style: italic;
   margin-left: 2px;
 }
-/* Size fields so they share the row proportionally */
-.dub-settings-field--lang    { flex: 1 1 100px; min-width: 90px; }
-.dub-settings-field--iso     { flex: 0 0 72px; }
-.dub-settings-field--engine  { flex: 1.4 1 130px; min-width: 110px; }
-.dub-settings-field--quality { flex: 0 0 auto; min-width: 100px; }
+/* Size fields so they share the row proportionally.
+   ISO sized to fit "xx — Long Language Name" without overflowing into Engine.
+   Engine widened so "LLM (OpenAI-compatible)" doesn't clip. */
+.dub-settings-field--lang    { flex: 1 1 140px; min-width: 120px; }
+.dub-settings-field--iso     { flex: 0 0 80px; min-width: 70px; max-width: 100px; }
+.dub-settings-field--engine  { flex: 1.4 1 180px; min-width: 160px; }
+.dub-settings-field--genre   { flex: 1 1 150px; min-width: 130px; }
+.dub-settings-field--quality { flex: 0 0 auto; min-width: 140px; }
 .dub-settings-field--quality > *:last-child { width: 100%; }
-.dub-settings-field--style   { flex: 1 1 90px; min-width: 80px; }
+.dub-settings-field--style   { flex: 1 1 140px; min-width: 120px; }
 @media (max-width: 960px) {
   .dub-settings-bar__fields { flex-direction: column; }
   .dub-settings-field--lang,
   .dub-settings-field--iso,
   .dub-settings-field--engine,
+  .dub-settings-field--genre,
   .dub-settings-field--quality,
-  .dub-settings-field--style { flex-basis: 100%; min-width: 0; }
+  .dub-settings-field--style { flex-basis: 100%; max-width: 100%; min-width: 0; }
 }
 
 /* Multi-lang mode toggle + picker — inline in actions row */
@@ -612,12 +624,32 @@
 /* ── Cast / speaker-voices strip below waveform ──────────────── */
 .dub-cast {
   margin-top: 4px;
-  padding: 4px var(--space-3);
+  padding: 5px var(--space-3);
   background: var(--chrome-bg);
   border-radius: var(--chrome-radius-pill);
   border: 1px solid var(--chrome-border);
 }
-.dub-cast__row          { display: flex; gap: var(--space-3); align-items: center; flex-wrap: wrap; }
+.dub-cast__row          {
+  display: flex;
+  gap: 8px 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.dub-cast__row--mode     { padding-bottom: 6px; border-bottom: 1px dashed var(--chrome-border); }
+.dub-cast__row--speakers { padding-top: 2px; }
+.dub-cast__select--narrator { min-width: 220px; max-width: 280px; }
+.dub-cast__badge {
+  font-family: var(--chrome-font-mono);
+  font-size: 0.6rem;
+  padding: 2px 6px;
+  border-radius: var(--chrome-radius-pill);
+  background: color-mix(in srgb, var(--chrome-accent) 12%, transparent);
+  color: var(--chrome-accent);
+  border: 1px solid var(--chrome-accent-border);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
 .dub-cast__kicker {
   font-family: var(--chrome-font-mono);
   font-size: var(--chrome-label-size);
@@ -625,10 +657,58 @@
   letter-spacing: var(--chrome-label-track);
   text-transform: uppercase;
   font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
-.dub-cast__pair         { display: flex; align-items: center; gap: 4px; }
-.dub-cast__label        { font-family: var(--chrome-font-mono); font-size: 0.65rem; color: var(--chrome-fg); }
-.dub-cast__select       { width: 100px; padding: 1px 4px; font-size: 0.62rem; }
+.dub-cast__pair         {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.dub-cast__label        {
+  font-family: var(--chrome-font-mono);
+  font-size: 0.65rem;
+  color: var(--chrome-fg);
+  white-space: nowrap;
+}
+.dub-cast__select       {
+  min-width: 180px;
+  max-width: 240px;
+  padding: 3px 6px;
+  font-size: 0.66rem;
+  line-height: 1.3;
+  height: 24px;
+}
+.dub-cast__pair--all .dub-cast__select { min-width: 200px; }
+.dub-cast__divider {
+  display: inline-block;
+  width: 1px;
+  align-self: stretch;
+  background: var(--chrome-border);
+  margin: 2px 4px;
+}
+.dub-cast__upload-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--chrome-border);
+  color: var(--chrome-fg-muted);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+}
+.dub-cast__upload-btn:hover:not(:disabled) {
+  background: var(--chrome-hover-bg);
+  color: var(--chrome-fg);
+  border-color: var(--chrome-border-strong);
+}
+.dub-cast__upload-btn:disabled { opacity: 0.5; cursor: wait; }
 
 /* Muted placeholder cast strip shown in the idle skeleton */
 .dub-cast--muted        { background: transparent; border-color: var(--chrome-border); }
@@ -647,6 +727,22 @@
 /* ── Output options row (footer) ─────────────────────────────── */
 .dub-outputs-title      { font-weight: 600; color: var(--color-fg); }
 .dub-outputs-default    { font-size: 0.6rem; padding: 2px 4px; width: 120px; }
+/* Audio Style lives in the CAST mode row — it shapes how the cast's voices
+   are mastered, not anything translate-related. Pushed to the right edge so
+   it reads as a separate "output of CAST" knob, not a mode option. */
+.dub-cast__audio-style {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.dub-cast__audio-style-select {
+  min-width: 170px;
+  max-width: 220px;
+  height: 24px;
+  padding: 2px 6px;
+  font-size: 0.66rem;
+}
 
 /* ── Footer download buttons ─────────────────────────────────── */
 /* Flat chrome surfaces — color = accent (text+border), not a gradient fill.

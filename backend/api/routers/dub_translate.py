@@ -4,6 +4,7 @@ import time
 import random
 import asyncio
 import logging
+from typing import Optional
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
@@ -162,9 +163,24 @@ def _unload_nllb():
 
 @router.get("/api/genres")
 async def list_translation_genres():
-    """Danh sách preset thể loại cho dropdown Genre trong UI."""
+    """Danh sách preset thể loại cho dropdown Genre trong UI.
+
+    Nguồn: skill MD files ở `backend/skills/translate/` (overlay) +
+    hardcoded GENRES (fallback layer khi folder trống).
+    """
     from services.translation_genres import list_genres
     return {"genres": list_genres()}
+
+
+@router.post("/api/skills/translate/reload")
+async def reload_translate_skills():
+    """Force-reload translate skills từ folder `backend/skills/translate/`.
+
+    Dùng sau khi user edit / thêm / xóa file MD mà không muốn restart backend.
+    """
+    from services.translation_skills import reload_skills, list_skills
+    reload_skills()
+    return {"skills": list_skills(), "count": len(list_skills())}
 
 
 @router.post("/dub/translate")
@@ -250,7 +266,7 @@ async def dub_translate(req: TranslateRequest):
             translated = await loop.run_in_executor(_gpu_pool, _translate_nllb)
             if os.environ.get("OMNIVOICE_UNLOAD_NLLB", "1") == "1":
                 _unload_nllb()
-            return {"translated": translated, "target_lang": req.target_lang, "source_lang": src_lang}
+            return await _post_process_translate(translated, req, src_lang, loop)
 
         # OpenAI / Ollama Local LLM Translation
         if provider == "openai":
@@ -397,7 +413,7 @@ async def dub_translate(req: TranslateRequest):
 
             translated = await asyncio.gather(*(_translate_llm(seg) for seg in req.segments))
             translated.sort(key=lambda x: str(x["id"]))
-            return {"translated": translated, "target_lang": req.target_lang, "source_lang": src_lang}
+            return await _post_process_translate(list(translated), req, src_lang, loop)
 
         # Offline Argos Translate
         if provider == "argos" or provider == "libretranslate":
@@ -440,7 +456,7 @@ async def dub_translate(req: TranslateRequest):
                 return results
 
             translated = await loop.run_in_executor(_cpu_pool, _translate_argos)
-            return {"translated": translated, "target_lang": req.target_lang, "source_lang": src_lang}
+            return await _post_process_translate(translated, req, src_lang, loop)
 
         # Legacy / API Deep_Translator logic.
         # Preflight the optional `deep_translator` dep once so we fail with a
@@ -503,7 +519,7 @@ async def dub_translate(req: TranslateRequest):
         translated = await asyncio.gather(*tasks)
         translated.sort(key=lambda x: str(x["id"]))
 
-        return await _maybe_cinematic(
+        return await _post_process_translate(
             translated, req, src_lang, loop,
         )
     except Exception as e:
@@ -511,107 +527,139 @@ async def dub_translate(req: TranslateRequest):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-async def _maybe_cinematic(translated, req, src_lang, loop):
-    """If quality=cinematic and a usable LLM is configured, run REFLECT+ADAPT.
-    Otherwise return Fast-mode shape unchanged.
+async def _apply_slot_fit(translated: list[dict], req, src_lang: str) -> list[dict]:
+    """Run the LLM speech-rate fit pass over any segment whose request carried
+    `slot_seconds`. Trims overflowing translations and expands underrunning ones
+    so TTS won't need to time-stretch (pitch artifact) or hard-trim (mid-word
+    clip) the audio later.
+
+    Runs for any translator provider — fast Google, NLLB, LLM one-shot, and
+    cinematic alike. Silently no-ops when the LLM is off (services/speech_rate
+    handles that internally), so the call site doesn't need to gate on it.
     """
-    quality = (getattr(req, "quality", None) or "fast").lower()
-    base = {"translated": translated, "target_lang": req.target_lang, "source_lang": src_lang, "quality_used": "fast"}
-
-    if quality != "cinematic":
-        return base
-
-    if not cinematic_available():
-        logger.warning("cinematic requested but no LLM configured — returning Fast result.")
-        base["cinematic_skipped"] = "no-llm-configured"
-        return base
-
-    # Build a map from id → original segment (to fetch source text + direction).
+    slots_by_id: dict[str, float] = {
+        str(s.id): float(s.slot_seconds)
+        for s in req.segments
+        if getattr(s, "slot_seconds", None) and float(s.slot_seconds) > 0
+    }
+    if not slots_by_id:
+        return translated
     source_by_id: dict[str, str] = {str(s.id): s.text for s in req.segments}
-    directions: dict[str, str] = {
-        str(s.id): s.direction
-        for s in req.segments
-        if getattr(s, "direction", None)
-    }
-    pairs = []
-    passthrough_index = {}
-    for i, row in enumerate(translated):
-        seg_id = str(row["id"])
-        literal = row.get("text", "") or ""
-        if row.get("error") or not literal.strip():
-            passthrough_index[seg_id] = row  # keep as-is, LLM won't help
-            continue
-        pairs.append((seg_id, source_by_id.get(seg_id, ""), literal))
 
-    if not pairs:
-        return base
+    from services.speech_rate import adjust_for_slot, rate_ratio, TOL_LOW, TOL_HIGH
 
-    refined = await cinematic_refine_many(
-        pairs,
-        source_lang=src_lang,
-        target_lang=req.target_lang,
-        glossary=req.glossary,
-        directions=directions,
-        executor=_cpu_pool,
-    )
-    refined_by_id = {r["id"]: r for r in refined}
+    # Re-use the translate semaphore so the slot-fit pass shares the same
+    # LLM back-pressure ceiling as the translation step itself. Without this,
+    # gathering N segments × up-to-3 retries each could blow past a local
+    # Ollama / LM Studio's queue or trip a cloud endpoint's 429.
+    sem = _get_llm_translate_sem()
 
-    # Phase 4.4 — speech-rate fit pass. Segment boundaries aren't in the
-    # translate request (by design — translator is boundary-agnostic), so we
-    # only run it when the caller supplied `slot_seconds` on each segment.
-    # The frontend populates this for Cinematic calls from the edit view.
-    slots_by_id = {
-        str(s.id): getattr(s, "slot_seconds", None)
-        for s in req.segments
-        if getattr(s, "slot_seconds", None)
-    }
-
-    merged = []
-    for row in translated:
-        seg_id = str(row["id"])
-        if seg_id in passthrough_index:
-            merged.append(row)
-            continue
-        r = refined_by_id.get(seg_id)
-        if r is None:
-            merged.append(row)
-            continue
-        out = {
-            "id": row["id"],
-            "text": r["text"],
-            "literal": r["literal"],
-            "critique": r.get("critique", ""),
-        }
-        if r.get("error"):
-            out["error"] = r["error"]
-
-        # Optional slot-fit pass — only when the caller asked for cinematic
-        # *and* provided a slot. Runs best-effort; no-LLM or mid-loop failure
-        # just leaves the cinematic text untouched.
+    async def _fit_one(row: dict) -> dict:
+        seg_id = str(row.get("id"))
+        text = (row.get("text") or "").strip()
         slot = slots_by_id.get(seg_id)
-        if slot and out["text"]:
-            try:
-                from services.speech_rate import adjust_for_slot
+        if not text or not slot or row.get("error"):
+            return row
+        # Cheap check first — if already inside tolerance, skip the LLM call.
+        r = rate_ratio(text, slot, req.target_lang)
+        if TOL_LOW <= r <= TOL_HIGH:
+            row["rate_ratio"] = r
+            return row
+        try:
+            async with sem:
                 fit = await asyncio.to_thread(
                     adjust_for_slot,
-                    out["text"],
-                    slot_seconds=float(slot),
+                    text,
+                    slot_seconds=slot,
                     target_lang=req.target_lang,
                     source_text=source_by_id.get(seg_id),
                 )
-                if fit.get("text"):
-                    out["text"] = fit["text"]
-                out["rate_ratio"] = fit.get("rate_ratio")
-                if fit.get("error"):
-                    out["rate_error"] = fit["error"]
-            except Exception as e:
-                logger.warning("rate-fit skipped for %s: %s", seg_id, e)
+            if fit.get("text"):
+                row["text"] = fit["text"]
+            row["rate_ratio"] = fit.get("rate_ratio")
+            if fit.get("error"):
+                row["rate_error"] = fit["error"]
+        except Exception as e:
+            logger.warning("rate-fit skipped for %s: %s", seg_id, e)
+        return row
 
-        merged.append(out)
+    return await asyncio.gather(*(_fit_one(row) for row in translated))
 
-    return {
-        "translated": merged,
+
+async def _post_process_translate(translated, req, src_lang, loop):
+    """Run optional cinematic refinement, then the slot-fit pass over the
+    final text. Both passes are no-ops when their preconditions are missing
+    (LLM unavailable / no slot_seconds), so this is safe to call from every
+    provider path.
+    """
+    quality = (getattr(req, "quality", None) or "fast").lower()
+    cinematic_skipped: Optional[str] = None
+
+    if quality == "cinematic":
+        if not cinematic_available():
+            logger.warning("cinematic requested but no LLM configured — returning Fast result.")
+            cinematic_skipped = "no-llm-configured"
+        else:
+            source_by_id: dict[str, str] = {str(s.id): s.text for s in req.segments}
+            directions: dict[str, str] = {
+                str(s.id): s.direction
+                for s in req.segments
+                if getattr(s, "direction", None)
+            }
+            pairs = []
+            passthrough_index: dict[str, dict] = {}
+            for row in translated:
+                seg_id = str(row["id"])
+                literal = row.get("text", "") or ""
+                if row.get("error") or not literal.strip():
+                    passthrough_index[seg_id] = row
+                    continue
+                pairs.append((seg_id, source_by_id.get(seg_id, ""), literal))
+
+            if pairs:
+                refined = await cinematic_refine_many(
+                    pairs,
+                    source_lang=src_lang,
+                    target_lang=req.target_lang,
+                    glossary=req.glossary,
+                    directions=directions,
+                    executor=_cpu_pool,
+                )
+                refined_by_id = {r["id"]: r for r in refined}
+
+                merged = []
+                for row in translated:
+                    seg_id = str(row["id"])
+                    if seg_id in passthrough_index:
+                        merged.append(row)
+                        continue
+                    r = refined_by_id.get(seg_id)
+                    if r is None:
+                        merged.append(row)
+                        continue
+                    out = {
+                        "id": row["id"],
+                        "text": r["text"],
+                        "literal": r["literal"],
+                        "critique": r.get("critique", ""),
+                    }
+                    if r.get("error"):
+                        out["error"] = r["error"]
+                    merged.append(out)
+                translated = merged
+
+    translated = await _apply_slot_fit(translated, req, src_lang)
+
+    resp = {
+        "translated": translated,
         "target_lang": req.target_lang,
         "source_lang": src_lang,
-        "quality_used": "cinematic",
+        "quality_used": "cinematic" if (quality == "cinematic" and not cinematic_skipped) else "fast",
     }
+    if cinematic_skipped:
+        resp["cinematic_skipped"] = cinematic_skipped
+    return resp
+
+
+# Backward-compat alias — older callers / tests may still import this name.
+_maybe_cinematic = _post_process_translate

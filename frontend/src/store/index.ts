@@ -68,6 +68,14 @@ export const useAppStore = create<AppStore>()(
         sidebarTab:                 s.sidebarTab,
         uiScale:                    s.uiScale,
         theme:                      s.theme,
+        // Dub-tab user prefs — language/style stick across reloads so users
+        // don't have to re-pick "Vietnamese" every time they open the app.
+        // (Pipeline state like job id, segments, progress stays transient.)
+        dubLang:       s.dubLang,
+        dubLangCode:   s.dubLangCode,
+        dubInstruct:   s.dubInstruct,
+        preserveBg:    s.preserveBg,
+        defaultTrack:  s.defaultTrack,
         // Generate-tab prefs — users expect their synthesis knobs to stick.
         language:      s.language,
         speed:         s.speed,

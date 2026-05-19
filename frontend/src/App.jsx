@@ -676,8 +676,12 @@ function App() {
       setDubFilename(s.dubFilename || data.video_path || '');
       setDubDuration(s.dubDuration || data.duration || 0);
       setDubSegments((s.dubSegments || []).map(x => ({ ...x, text_original: x.text_original || x.text || '' })));
-      setDubLang(s.dubLang || 'Auto');
-      setDubLangCode(s.dubLangCode || 'en');
+      // Only override if the project actually saved a language — otherwise
+      // keep the user's current pick (which is now persisted across reloads).
+      // Without this guard, opening any pre-language-persist project would
+      // silently reset Vietnamese → Auto.
+      if (s.dubLang) setDubLang(s.dubLang);
+      if (s.dubLangCode) setDubLangCode(s.dubLangCode);
       setDubInstruct(s.dubInstruct || '');
       setDubTracks(s.dubTracks || []);
       setDubTranscript(s.dubTranscript || '');
@@ -718,8 +722,10 @@ function App() {
       setDubDuration(job.duration || 0);
       setDubSegments((job.segments || []).map((s, i) => ({ ...s, id: s.id != null ? String(s.id) : String(i), text_original: s.text_original || s.text || '' })));
       setDubTranscript(job.full_transcript || '');
-      setDubLang(item.language || 'Auto');
-      setDubLangCode(item.language_code || 'und');
+      // History items always carry the language they were dubbed in; only
+      // override if present. Old items predate the field — keep user's pick.
+      if (item.language) setDubLang(item.language);
+      if (item.language_code) setDubLangCode(item.language_code);
       setDubTracks(Object.keys(job.dubbed_tracks || {}));
       setDubStep(Object.keys(job.dubbed_tracks || {}).length > 0 ? 'done' : 'editing');
       // Phase 4.5 — seg_hashes are written per successful segment by

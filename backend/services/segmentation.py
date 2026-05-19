@@ -542,14 +542,15 @@ def _split_segment_by_speaker_turns(seg: dict, diarization, min_turn_dur: float 
 def assign_speakers_from_diarization(
     segments: List[dict],
     diarization,
-    split_multi_speaker: bool = True,
+    split_multi_speaker: bool = False,
 ) -> List[dict]:
     """Replace speaker_id based on pyannote diarization (overlap-weighted).
 
-    Nếu `split_multi_speaker=True` (default), segment chứa nhiều speakers sẽ
-    được TÁCH thành nhiều sub-segment theo turn boundaries của Pyannote.
-    Trước đây code chỉ gán 1 speaker/segment dù bên trong có 2 người → 2 lời
-    thoại của 2 nhân vật bị merge vào 1 đoạn text.
+    `split_multi_speaker=True` tách segment có nhiều speakers thành sub-segments
+    theo turn boundaries của Pyannote. Default đã đổi về False vì khi WhisperX
+    không trả word-level timestamps, sub-text được chia theo ratio ký tự —
+    cắt giữa từ → TTS đọc cụt và sinh "à ừm" filler. Bật lại có chủ đích khi
+    transcript chắc chắn có word timing tốt và scene thực sự đa nhân vật.
     """
     if split_multi_speaker:
         expanded: List[dict] = []

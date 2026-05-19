@@ -121,10 +121,22 @@ GENRES: dict[str, dict] = {
 
 
 def get_genre_prompt(genre: Optional[str]) -> str:
-    """Trả system_prompt_extra cho genre. Empty string nếu genre không hợp lệ
-    hoặc None (caller sẽ fallback về base prompt)."""
+    """Trả system_prompt_extra cho genre.
+
+    Lookup order: skill MD file → hardcoded GENRES → empty.
+    Skill files ở `backend/skills/translate/` là nguồn chính; GENRES là
+    fallback nếu folder rỗng hoặc skill bị xóa (giữ app không break).
+    """
     if not genre:
         return ""
+    try:
+        from services.translation_skills import get_skill_prompt
+        skill_prompt = get_skill_prompt(genre)
+        if skill_prompt:
+            return skill_prompt
+    except Exception:
+        # Loader failed (filesystem issue, bad MD, etc.) — silent fallback.
+        pass
     entry = GENRES.get(genre)
     if not entry:
         return ""
@@ -132,8 +144,34 @@ def get_genre_prompt(genre: Optional[str]) -> str:
 
 
 def list_genres() -> list[dict]:
-    """List các genre cho API endpoint /api/genres. Dùng cho frontend dropdown."""
-    return [
-        {"id": gid, "label": g["label"], "description": g["description"]}
-        for gid, g in GENRES.items()
-    ]
+    """List genres cho API endpoint /api/genres.
+
+    Trả skills từ MD files nếu có; fallback hardcoded GENRES nếu skills dir
+    trống. Merge: skill MD wins khi trùng id, GENRES bổ sung phần còn thiếu.
+    """
+    merged: dict[str, dict] = {}
+    # Start với hardcoded GENRES (fallback layer).
+    for gid, g in GENRES.items():
+        merged[gid] = {
+            "id": gid,
+            "label": g["label"],
+            "description": g["description"],
+            "source_languages": [],
+            "version": "built-in",
+            "author": "built-in",
+        }
+    # Overlay skills từ MD — wins khi trùng id.
+    try:
+        from services.translation_skills import list_skills
+        for s in list_skills():
+            merged[s["id"]] = {
+                "id": s["id"],
+                "label": s["label"],
+                "description": s["description"],
+                "source_languages": s.get("source_languages") or [],
+                "version": s.get("version") or "1.0.0",
+                "author": s.get("author") or "local",
+            }
+    except Exception:
+        pass
+    return list(merged.values())
