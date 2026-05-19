@@ -4,14 +4,48 @@
  * Extracted from App.jsx to reduce its useState/useRef/useCallback count.
  * All segment mutations go through this hook so undo tracking is automatic.
  */
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { useAppStore } from '../store';
 import { askConfirm } from '../utils/dialog';
 import { apiPost } from '../api/client';
+import { syncDubSegments } from '../api/dub';
 
 export default function useSegmentEditing() {
   const dubSegments = useAppStore(s => s.dubSegments);
   const setDubSegments = useAppStore(s => s.setDubSegments);
+  const dubJobId = useAppStore(s => s.dubJobId);
+  const dubStep = useAppStore(s => s.dubStep);
+
+  // ── Debounced auto-save segments back to backend ──
+  // Frontend edits (text/start/end/speaker_id…) chỉ tồn tại trong store +
+  // localStorage cho đến khi đẩy lên backend. Không đẩy → restore từ sidebar
+  // / timeline rebalance / snapshot ops sẽ thấy job_data cũ.
+  //
+  // Debounce 1500ms: gõ liên tục chỉ flush một lần khi user dừng nhập.
+  // Skip khi đang transcribe/generate/stopping để tránh race với backend writer.
+  const syncTimerRef = useRef(null);
+  const lastSyncedRef = useRef(null);
+  useEffect(() => {
+    if (!dubJobId || !dubSegments?.length) return;
+    if (dubStep === 'transcribing' || dubStep === 'generating' || dubStep === 'stopping' || dubStep === 'uploading') return;
+    // Bỏ qua initial mount/restore — chỉ sync khi reference thực sự đổi sau lần sync gần nhất.
+    if (lastSyncedRef.current === dubSegments) return;
+
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(async () => {
+      try {
+        await syncDubSegments(dubJobId, dubSegments);
+        lastSyncedRef.current = dubSegments;
+      } catch (err) {
+        // Im lặng — user edit lần sau sẽ retry. Log để debug khi cần.
+        console.warn('Sync segments failed:', err?.message || err);
+      }
+    }, 1500);
+
+    return () => {
+      if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    };
+  }, [dubJobId, dubSegments, dubStep]);
 
   // ── Undo / Redo ──
   const undoStack = useRef([]);

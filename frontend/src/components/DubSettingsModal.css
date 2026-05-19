@@ -1,0 +1,184 @@
+/* DubSettingsModal — bottom drawer reusing the ExportModal shell tokens. */
+
+.dub-settings-drawer {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--logs-footer-height, 28px);
+  z-index: 90;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.dub-settings-drawer__sheet {
+  pointer-events: auto;
+  width: min(960px, calc(100vw - 24px));
+  max-height: min(85vh, 820px);
+  display: flex;
+  flex-direction: column;
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border-strong);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  box-shadow:
+    0 -8px 24px rgba(0, 0, 0, 0.45),
+    0 -1px 0 var(--chrome-border) inset;
+  animation: dub-settings-slide-up var(--dur-base, 180ms) var(--ease-out, cubic-bezier(.2,.8,.2,1));
+  overflow: hidden;
+}
+@keyframes dub-settings-slide-up {
+  from { transform: translateY(100%); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
+.dub-settings-drawer__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 14px var(--space-5, 20px) 16px;
+  border-bottom: 1px solid var(--chrome-border);
+  background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+  position: relative;
+  font-size: 15px;
+}
+.dub-settings-drawer__head strong {
+  font-size: 17px;
+}
+.dub-settings-drawer__hint {
+  font-size: 13px !important;
+}
+.dub-settings-drawer__handle {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--chrome-border-strong);
+}
+.dub-settings-drawer__hint {
+  font-size: var(--text-xs);
+  color: var(--chrome-fg-muted);
+  margin-left: auto;
+}
+.dub-settings-drawer__close {
+  width: var(--chrome-icon-btn, 22px);
+  height: var(--chrome-icon-btn, 22px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--chrome-radius-pill);
+  color: var(--chrome-fg-muted);
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
+}
+.dub-settings-drawer__close:hover {
+  background: var(--chrome-hover-bg);
+  color: var(--chrome-fg);
+  border-color: var(--chrome-border-strong);
+}
+
+.dub-settings-drawer__body {
+  padding: var(--space-4) var(--space-5, 20px) var(--space-5, 20px);
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-5, 20px) var(--space-5, 24px);
+}
+.dub-settings-section--full {
+  grid-column: 1 / -1;
+}
+.dub-settings-section--full .dub-settings-section__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 var(--space-5, 24px);
+}
+@media (max-width: 720px) {
+  .dub-settings-section--full .dub-settings-section__grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 720px) {
+  .dub-settings-drawer__body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dub-settings-section h4 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--chrome-fg);
+  letter-spacing: 0.2px;
+}
+.dub-settings-section__desc {
+  margin: 0 0 var(--space-3);
+  font-size: 13px;
+  color: var(--chrome-fg-muted);
+  line-height: 1.5;
+}
+
+.dub-settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+  border-bottom: 1px dashed var(--chrome-border);
+}
+.dub-settings-row:last-child { border-bottom: none; }
+
+.dub-settings-row__label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--chrome-fg);
+}
+.dub-settings-row__value {
+  margin-left: auto;
+  font-family: var(--chrome-font-mono);
+  font-size: 13px;
+  color: var(--chrome-fg);
+  background: rgba(255,255,255,0.05);
+  padding: 3px 10px;
+  border-radius: 4px;
+  min-width: 64px;
+  text-align: center;
+}
+.dub-settings-row__reset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px; height: 22px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--chrome-radius-pill);
+  color: var(--chrome-fg-muted);
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+.dub-settings-row__reset:hover {
+  background: var(--chrome-hover-bg);
+  color: var(--chrome-fg);
+}
+.dub-settings-row__hint {
+  font-size: 13px;
+  color: var(--chrome-fg-muted);
+  line-height: 1.45;
+}
+.dub-settings-row__slider {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--accent, #d3869b);
+  cursor: pointer;
+}
+.dub-settings-row__control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}

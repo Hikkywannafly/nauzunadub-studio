@@ -52,6 +52,34 @@ class DubRequest(BaseModel):
     # Quyết định compressor strength + RMS-normalize target để giọng dub khớp
     # loại content (phim/podcast/narrator/raw). Xem services/audio_dsp.py.
     audio_profile: Optional[str] = "broadcast"
+    # Mix-time fade & tail-allowance knobs (giây / mili-giây). Optional;
+    # nếu None thì dub_generate.py dùng default tuned trong module.
+    start_fade_ms: Optional[int] = None
+    end_fade_ms: Optional[int] = None
+    tail_allowance_s: Optional[float] = None
+    # Speed-from-text-length slot-fit clamp. Khi None → giữ ±15% (0.85–1.25)
+    # đã tune. User cho phép nới rộng/co lại để chấp nhận pitch-shift nhiều
+    # hơn (tăng range) hoặc giữ pace tự nhiên hơn (giảm range).
+    slot_factor_min: Optional[float] = None
+    slot_factor_max: Optional[float] = None
+    # Khi audio gen ra NGẮN hơn slot — mặc định để khoảng lặng cuối seg.
+    # Tuỳ chọn:
+    #   "off"         — giữ hành vi cũ (silence cuối seg)
+    #   "stretch_up"  — time-stretch giọng dài ra cho khớp đúng `end` (pitch
+    #                   trầm nhẹ, ratio >1.15× nghe rõ)
+    #   "anchor_end"  — giữ độ dài tự nhiên nhưng align về `end`, im lặng
+    #                   nằm ở ĐẦU seg thay vì cuối
+    fill_slot_mode: Optional[str] = "off"
+    # Master switch cho 3 tầng scaling (pre-TTS speed nudge, mix-time DOWN-fit,
+    # mix-time UP-fill). Override mọi setting khác:
+    #   "fit_slot"   — giữ mặc định (scale theo slot, dùng các knob ở trên)
+    #   "natural"    — KHÔNG scale gì hết: text dài → audio overlap seg kế
+    #                  (additive mix); text ngắn → silence cuối seg. Giọng đọc
+    #                  tự nhiên hoàn toàn, lip-sync neo theo seg.start.
+    #   "sequential" — KHÔNG scale, nhưng nếu seg N tràn → đẩy seg N+1 lùi lại
+    #                  cho không overlap. Audio cuối phim có thể dài hơn video
+    #                  gốc; lip-sync drift dần qua các seg dài.
+    tts_pacing: Optional[str] = "fit_slot"
 
 class TranslateSegment(BaseModel):
     id: str

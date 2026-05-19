@@ -52,17 +52,20 @@ function DubSegmentRow({
   const speakerOptions = speakerClones ? Object.keys(speakerClones) : [];
   const speakerListId = `seg-speakers-${seg.id}`;
 
-  // Pre-TTS read-speed warning — tính local theo char count vs slot duration.
-  // Cùng công thức + threshold với backend services/speech_rate.py để badge
-  // và LLM shorten dùng chung 1 sự thật. Backend recompute lại khi shorten.
+  // Pre-TTS read-speed warning — chỉ tính sau khi đã translate. Text gốc
+  // (chưa translate) đọc với CPS của ngôn ngữ đích sẽ ra ratio sai (vd EN
+  // text tính theo VN 13cps → false-positive vượt slot). Marker đáng tin
+  // duy nhất là `text_original` đã được set và khác `text` hiện tại — đó
+  // là dấu hiệu translate đã chạy.
   const slotSeconds = Math.max(0, (seg.end ?? 0) - (seg.start ?? 0));
   const fitLang = (seg.target_lang || dubLangCode || 'vi').toLowerCase();
+  const isTranslated = !!seg.text_original && seg.text !== seg.text_original;
   const liveRatio = useMemo(
     () => computeRateRatio(seg.text || '', slotSeconds, fitLang),
     [seg.text, slotSeconds, fitLang],
   );
   const liveSeverity = severityTier(liveRatio);
-  const showFitBadge = liveSeverity !== 'ok' && (seg.text || '').trim().length > 0 && slotSeconds > 0;
+  const showFitBadge = isTranslated && liveSeverity !== 'ok' && (seg.text || '').trim().length > 0 && slotSeconds > 0;
   const fitBadgeColor = liveSeverity === 'critical' ? '#fb4934'
     : liveSeverity === 'warn' ? '#fabd2f'
     : '#83a598'; // 'short'
@@ -75,7 +78,10 @@ function DubSegmentRow({
       ? `Hơi gấp ${Math.round((liveRatio - 1) * 100)}% — vẫn fit được nhưng đọc nhanh hơn. Click ✂️ Shorten nếu muốn thư thả.`
       : `Quá ngắn (${Math.round(liveRatio * 100)}% slot) — TTS sẽ có khoảng lặng dài cuối câu.`;
   const isShortening = shorteningId === seg.id;
-  const canShorten = !!onShorten && liveSeverity !== 'ok' && liveSeverity !== 'short' && !disabled;
+  // Optimize action chỉ enable cho segment đã translate. Backend `adjust_for_slot`
+  // bidirectional: vượt → rút gọn, ngắn → expand. UI label đổi theo direction
+  // để user biết tác động.
+  const canShorten = !!onShorten && isTranslated && liveSeverity !== 'ok' && !disabled;
   const syncColor = seg.sync_ratio === undefined ? null
     : (seg.sync_ratio >= 0.95 && seg.sync_ratio <= 1.05) ? '#b8bb26'
     : seg.sync_ratio > 1.25 ? '#fb4934'
@@ -151,7 +157,31 @@ function DubSegmentRow({
             }}
           />
           <span className="seg-time-sep">–</span>
-          <span className="seg-time-end">{formatTime(seg.end)}</span>
+          <input
+            type="text"
+            className="seg-time-input"
+            defaultValue={formatTime(seg.end)}
+            key={`end-${seg.id}-${seg.end}`}
+            disabled={disabled}
+            title="Click to edit end time (m:ss.s). Enter to commit, Esc to cancel."
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.target.blur();
+              if (e.key === 'Escape') { e.target.value = formatTime(seg.end); e.target.blur(); }
+            }}
+            onBlur={(e) => {
+              const v = parseTime(e.target.value);
+              if (v == null || v <= seg.start) {
+                e.target.value = formatTime(seg.end);
+                return;
+              }
+              if (Math.abs(v - seg.end) > 1e-3) {
+                onEditField(seg.id, 'end', +v.toFixed(3));
+              } else {
+                e.target.value = formatTime(seg.end);
+              }
+            }}
+          />
           {seg.speed && seg.speed !== 1.0 && (
             <span className="seg-speed-badge" style={{ color: seg.speed > 1 ? '#d3869b' : '#8ec07c' }}>
               {seg.speed.toFixed(2)}x
@@ -320,15 +350,17 @@ function DubSegmentRow({
               onSelect: () => onDirect?.(seg),
             },
             {
-              id: 'shorten',
+              id: 'optimize',
               label: isShortening
-                ? 'Shortening…'
+                ? 'Đang tối ưu…'
                 : liveSeverity === 'critical'
-                  ? `✂️ Shorten (vượt ${Math.round((liveRatio - 1) * 100)}%)`
+                  ? `✨ Optimize (vượt ${Math.round((liveRatio - 1) * 100)}%)`
                   : liveSeverity === 'warn'
-                    ? `✂️ Shorten (gấp ${Math.round((liveRatio - 1) * 100)}%)`
-                    : '✂️ Shorten',
-              icon: ScissorsIcon,
+                    ? `✨ Optimize (gấp ${Math.round((liveRatio - 1) * 100)}%)`
+                    : liveSeverity === 'short'
+                      ? `✨ Optimize (ngắn ${Math.round((1 - liveRatio) * 100)}%)`
+                      : '✨ Optimize',
+              icon: Sparkles,
               disabled: !canShorten || isShortening,
               onSelect: () => onShorten?.(seg),
             },

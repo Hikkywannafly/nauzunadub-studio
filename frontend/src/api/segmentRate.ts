@@ -34,6 +34,16 @@ export async function shortenSegment(req: ShortenRequest): Promise<ShortenRespon
   });
 }
 
+/** Bidirectional: shorten when vượt slot, expand when short. Cùng response
+ * shape với shortenSegment — frontend chỉ đổi label theo direction. */
+export async function optimizeSegment(req: ShortenRequest): Promise<ShortenResponse> {
+  return apiJson<ShortenResponse>('/dub/segment/optimize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+}
+
 /** Tính ratio + severity (không gọi LLM) — cho preview/badge. */
 export async function rateCheckSegment(
   text: string,

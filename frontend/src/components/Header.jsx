@@ -5,14 +5,14 @@ import { Button, Badge } from '../ui';
 import NotificationPanel from './NotificationPanel';
 
 const VIEW_META = {
-  launchpad:  { label: 'Launchpad',       Icon: Globe,       accent: '#f3a5b6', kicker: 'Studio' },
-  clone:      { label: 'Voice Clone',     Icon: Fingerprint, accent: '#d3869b', kicker: 'Studio' },
-  design:     { label: 'Voice Design',    Icon: Wand2,       accent: '#8ec07c', kicker: 'Studio' },
-  dub:        { label: 'Dubbing',         Icon: Film,        accent: '#fe8019', kicker: 'Studio' },
-  projects:   { label: 'OmniDrive',      Icon: FolderOpen,  accent: '#83a598', kicker: 'Library' },
-  gallery:    { label: 'Gallery',         Icon: Library,     accent: '#b8bb26', kicker: 'Library' },
+  launchpad: { label: 'Launchpad', Icon: Globe, accent: '#f3a5b6', kicker: 'Studio' },
+  clone: { label: 'Voice Clone', Icon: Fingerprint, accent: '#d3869b', kicker: 'Studio' },
+  design: { label: 'Voice Design', Icon: Wand2, accent: '#8ec07c', kicker: 'Studio' },
+  dub: { label: 'Dubbing', Icon: Film, accent: '#fe8019', kicker: 'Studio' },
+  projects: { label: 'OmniDrive', Icon: FolderOpen, accent: '#83a598', kicker: 'Library' },
+  gallery: { label: 'Gallery', Icon: Library, accent: '#b8bb26', kicker: 'Library' },
   transcriptions: { label: 'Transcriptions', Icon: FileText, accent: '#d3869b', kicker: 'Library' },
-  settings:   { label: 'Settings',        Icon: Settings2,   accent: '#fabd2f', kicker: 'Preferences' },
+  settings: { label: 'Settings', Icon: Settings2, accent: '#fabd2f', kicker: 'Preferences' },
   enterprise: { label: 'Commercial License', Icon: Building2, accent: '#fe8019', kicker: 'Licensing' },
 };
 
@@ -97,7 +97,7 @@ export default function Header({
           const data = await res.json();
           setLoadedModels(data.models || []);
         }
-      } catch {}
+      } catch { }
     };
     fetchModels();
   }, [flushOpen]);
@@ -123,12 +123,12 @@ export default function Header({
       if (res.ok) {
         setLoadedModels(prev => prev.filter(m => m.id !== modelId));
       }
-    } catch {} finally {
+    } catch { } finally {
       setUnloading(null);
     }
   };
   // Dynamic accent color must stay inline — it's driven by the current view.
-  const dotStyle   = { background: view.accent, boxShadow: `0 0 10px ${view.accent}90` };
+  const dotStyle = { background: view.accent, boxShadow: `0 0 10px ${view.accent}90` };
   const labelStyle = { color: view.accent };
   return (
     <div
@@ -178,7 +178,7 @@ export default function Header({
           <path d="M16 9v6" />
         </svg>
         <span className="hq-logo-word">
-          Omni<span className="hq-logo-word__accent">Voice</span>
+          Nauzuna<span className="hq-logo-word__accent">Chan</span>
         </span>
       </div>
 

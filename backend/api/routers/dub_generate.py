@@ -296,16 +296,22 @@ async def dub_generate(job_id: str, req: DubRequest):
             # ±15% — beyond that the speech sounds unnaturally rushed or
             # sluggish, and any remaining mismatch is better handled by
             # tail-allowance / time-stretch at mix time.
-            try:
-                from services.speech_rate import expected_duration
-                lang_for_rate = req.language_code or "en"
-                expected_s = expected_duration(seg.text, lang_for_rate)
-                if seg_duration > 0 and expected_s > 0:
-                    slot_factor = expected_s / seg_duration
-                    slot_factor = max(0.85, min(1.25, slot_factor))
-                    seg_speed = (seg_speed or 1.0) * slot_factor
-            except Exception as _e:
-                logger.debug("speed slot-fit skipped for %s: %s", seg_id, _e)
+            # Pre-TTS speed nudge — skip entirely khi user chọn "natural" pacing.
+            # Trong natural mode, giọng đọc theo speed thật (req.speed hoặc
+            # seg.speed), không bị ép vào slot duration.
+            if (req.tts_pacing or "fit_slot").lower() != "natural":
+                try:
+                    from services.speech_rate import expected_duration
+                    lang_for_rate = req.language_code or "en"
+                    expected_s = expected_duration(seg.text, lang_for_rate)
+                    if seg_duration > 0 and expected_s > 0:
+                        slot_factor = expected_s / seg_duration
+                        sf_min = req.slot_factor_min if req.slot_factor_min is not None else 0.85
+                        sf_max = req.slot_factor_max if req.slot_factor_max is not None else 1.25
+                        slot_factor = max(sf_min, min(sf_max, slot_factor))
+                        seg_speed = (seg_speed or 1.0) * slot_factor
+                except Exception as _e:
+                    logger.debug("speed slot-fit skipped for %s: %s", seg_id, _e)
 
             # Phase 4.2 — if the segment carries a free-form direction, parse it
             # and append the taxonomy instruct (e.g. "urgent, surprised") on top
@@ -421,72 +427,130 @@ async def dub_generate(job_id: str, req: DubRequest):
         _t_diskw = time.perf_counter() - _t_diskw_0
 
         sr = _model.sampling_rate
-        total_samples = int(job["duration"] * sr)
-        full_audio = torch.zeros(1, total_samples)
+        video_samples = int(job["duration"] * sr)
 
-        slot_fit = (req.slot_fit or "time_stretch").lower()
+        # Resolve mix-time knobs from request (fall back to module defaults).
+        # `tts_pacing` overrides slot_fit + fill_slot_mode for non-default modes:
+        #   - natural: voice plays at natural duration, anchored at seg.start;
+        #     audio dài hơn slot → overlap additive với seg kế.
+        #   - sequential: voice plays at natural duration; nếu seg N tràn →
+        #     seg N+1 bị đẩy lùi để KHÔNG overlap. Final audio có thể dài hơn
+        #     video gốc → ta nới buffer cho vừa.
+        pacing = (req.tts_pacing or "fit_slot").lower()
+        if pacing in ("natural", "sequential"):
+            slot_fit = "off"
+            fill_slot_mode = "off"
+        else:
+            slot_fit = (req.slot_fit or "time_stretch").lower()
+            fill_slot_mode = (req.fill_slot_mode or "off").lower()
+
+        # Sequential mode: pre-walk to figure out final buffer length so we
+        # don't truncate any seg that gets pushed past video duration. Without
+        # this, full_audio is sized to job duration and the last seg's tail
+        # gets clipped silently.
+        if pacing == "sequential":
+            _cursor = 0
+            for _sstart, _send, _w, _ in all_segment_wavs:
+                _natural_anchor = int(_sstart * sr)
+                _anchor = max(_natural_anchor, _cursor)
+                _cursor = _anchor + int(_w.shape[-1])
+            total_samples = max(video_samples, _cursor)
+        else:
+            total_samples = video_samples
+        full_audio = torch.zeros(1, total_samples)
+        _start_fade_ms = req.start_fade_ms if req.start_fade_ms is not None else _START_FADE_MS
+        _end_fade_ms = req.end_fade_ms if req.end_fade_ms is not None else _END_FADE_MS
+        _tail_allowance_s = req.tail_allowance_s if req.tail_allowance_s is not None else _TAIL_ALLOWANCE_S
+        _start_fade_samples = int((_start_fade_ms / 1000.0) * sr)
+        _end_fade_samples = int((_end_fade_ms / 1000.0) * sr)
+
         # Pre-compute each seg's neighbour start so the tail-allowance lookup
         # below is O(1). Assumes `all_segment_wavs` is in chronological order,
         # which it always is — segments come from a sorted transcript and we
-        # don't reorder them anywhere upstream. Overlapping neighbours fall
-        # back to gap=0 via the `max(0.0, ...)` clamp later.
+        # don't reorder them anywhere upstream.
         next_starts = [
             all_segment_wavs[i + 1][0] if i + 1 < len(all_segment_wavs) else job["duration"]
             for i in range(len(all_segment_wavs))
         ]
 
-        for i, (start, end, wav, _) in enumerate(all_segment_wavs):
-            s = int(start * sr)
+        def _resample_to(x, target_samples):
+            """Linear-interp resample. Slight pitch shift; acceptable ≤1.15×,
+            audible ≥1.3×. Used by both DOWN-fit (slot_fit=time_stretch) and
+            UP-fill (fill_slot_mode=stretch_up)."""
+            return torch.nn.functional.interpolate(
+                x.unsqueeze(0),
+                size=max(1, target_samples),
+                mode='linear',
+                align_corners=False,
+            ).squeeze(0)
+
+        write_cursor = 0  # last sample written across all segs — sequential mode push
+        for i, (seg_start, seg_end, wav, _) in enumerate(all_segment_wavs):
             seg_ref = req.segments[i] if i < len(req.segments) else None
-            seg_gain = getattr(seg_ref, "gain", None) if seg_ref is not None else None
-            seg_gain = seg_gain if seg_gain is not None else 1.0
-            seg_gain = max(0.0, min(2.0, seg_gain))
+            raw_gain = getattr(seg_ref, "gain", None) if seg_ref is not None else None
+            seg_gain = max(0.0, min(2.0, raw_gain if raw_gain is not None else 1.0))
             adjusted = wav * seg_gain
 
-            slot_samples = int(max(0.0, (end - start)) * sr)
-            # Tail allowance: how far past `end` are we permitted to play
-            # before we'd hit the next segment? Capped at _TAIL_ALLOWANCE_S so
-            # a long silent gap doesn't let one line run on forever.
-            gap_seconds = max(0.0, next_starts[i] - end)
-            tail_seconds = min(_TAIL_ALLOWANCE_S, gap_seconds)
-            allowed_samples = slot_samples + int(tail_seconds * sr)
-
-            # Slot-fit: keep each seg from bleeding past its tail allowance.
-            # "time_stretch" resamples via linear interpolation (slight pitch
-            # lift on compression — negligible at ≤1.15×, audible at ≥1.3×).
-            # "trim" hard-clips + relies on the longer fade-out below to mask
-            # the cut. "off" is the legacy overlap behaviour.
+            slot_samples = int(max(0.0, (seg_end - seg_start)) * sr)
+            # Tail allowance: cap how far audio may bleed past `seg_end` into
+            # the gap before the next segment. Keeps natural breath/decay but
+            # prevents overlap with the next speaker.
+            gap_seconds = max(0.0, next_starts[i] - seg_end)
+            allowed_samples = slot_samples + int(min(_tail_allowance_s, gap_seconds) * sr)
             wl = adjusted.shape[-1]
+            natural_anchor = int(seg_start * sr)
+            # Sequential mode: nếu seg trước tràn qua đây, đẩy anchor lùi để
+            # tránh overlap. Các mode khác giữ anchor = seg.start (lip-sync).
+            if pacing == "sequential":
+                anchor_samples = max(natural_anchor, write_cursor)
+            else:
+                anchor_samples = natural_anchor
+
+            # ── 1. DOWN-fit: audio longer than allowed slot+tail ───────
+            # "time_stretch" resamples (pitch lift); "trim" hard-clips and
+            # leans on the longer end-fade below to mask the cut. "off" is
+            # the legacy overlap behaviour (skip the branch entirely).
             if slot_fit != "off" and allowed_samples > 0 and wl > allowed_samples:
                 if slot_fit == "time_stretch":
                     try:
-                        adjusted = torch.nn.functional.interpolate(
-                            adjusted.unsqueeze(0),
-                            size=allowed_samples,
-                            mode='linear',
-                            align_corners=False,
-                        ).squeeze(0)
-                    except Exception as e:
-                        logger.warning("time_stretch failed for seg %d, falling back to trim: %s", i, e)
+                        adjusted = _resample_to(adjusted, allowed_samples)
+                    except Exception as err:
+                        logger.warning("time_stretch failed for seg %d, falling back to trim: %s", i, err)
                         adjusted = adjusted[..., :allowed_samples]
                 else:  # "trim"
                     adjusted = adjusted[..., :allowed_samples]
                 wl = adjusted.shape[-1]
 
-            start_fade = int((_START_FADE_MS / 1000.0) * sr)
-            end_fade = int((_END_FADE_MS / 1000.0) * sr)
-            # Longer end-fade hides any natural-tail trim and softens the
-            # transition into the next seg / background-mix.
-            if wl > start_fade + end_fade:
-                if start_fade > 0:
-                    ramp_up = torch.linspace(0, 1, start_fade, device=adjusted.device)
-                    adjusted[0, :start_fade] *= ramp_up
-                if end_fade > 0:
-                    ramp_down = torch.linspace(1, 0, end_fade, device=adjusted.device)
-                    adjusted[0, -end_fade:] *= ramp_down
+            # ── 2. UP-fill: audio shorter than slot, optional pull-to-end ─
+            # Only fires on naturally-short audio (after DOWN-fit, wl is at
+            # most allowed_samples ≥ slot_samples, so the condition is false).
+            elif fill_slot_mode != "off" and slot_samples > 0 and wl < slot_samples:
+                if fill_slot_mode == "stretch_up":
+                    try:
+                        adjusted = _resample_to(adjusted, slot_samples)
+                        wl = adjusted.shape[-1]
+                    except Exception as err:
+                        logger.warning("stretch_up failed for seg %d, leaving as-is: %s", i, err)
+                elif fill_slot_mode == "anchor_end":
+                    # Shift anchor so audio's tail lands exactly at slot end.
+                    # Leading silence fills the head of the slot instead of
+                    # trailing silence. wl < slot_samples guarantees the new
+                    # anchor stays inside [seg_start*sr, seg_end*sr).
+                    anchor_samples = int(seg_end * sr) - wl
 
-            e = min(s + wl, total_samples)
-            full_audio[:, s:e] += adjusted[:, :e - s]
+            # ── 3. Fades — only apply when seg is long enough to host them.
+            if wl > _start_fade_samples + _end_fade_samples:
+                if _start_fade_samples > 0:
+                    ramp_up = torch.linspace(0, 1, _start_fade_samples, device=adjusted.device)
+                    adjusted[0, :_start_fade_samples] *= ramp_up
+                if _end_fade_samples > 0:
+                    ramp_down = torch.linspace(1, 0, _end_fade_samples, device=adjusted.device)
+                    adjusted[0, -_end_fade_samples:] *= ramp_down
+
+            # ── 4. Write into the full timeline, clamped to bounds ─────
+            write_end = min(anchor_samples + wl, total_samples)
+            full_audio[:, anchor_samples:write_end] += adjusted[:, :write_end - anchor_samples]
+            write_cursor = anchor_samples + wl
 
         lang_code = req.language_code or "und"
         track_path = os.path.join(DUB_DIR, job_id, f"dubbed_{lang_code}.wav")

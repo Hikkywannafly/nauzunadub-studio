@@ -604,15 +604,31 @@ function App() {
     toast(`Upgrading ${previewSegIds.length} preview-quality segment${previewSegIds.length === 1 ? '' : 's'} to full quality…`, { icon: '✨' });
     await handleDubGenerate({ regenOnly: previewSegIds, preview: false });
   };
-  const handleDubDownload = async () => {
+  const handleDubDownload = async (opts = {}) => {
     await finalizeTtsBeforeExport();
     // Build selected tracks from all known tracks, matching the checkbox `!== false` logic
     const selected = [];
     if (exportTracks['original'] !== false) selected.push('original');
     dubTracks.forEach(t => { if (exportTracks[t] !== false) selected.push(t); });
     const tracksParam = selected.join(',');
-    const burnParam = burnSubs ? `&burn_subs=1&dual=${dualSubs ? 1 : 0}` : '';
-    triggerDownload(`${API}/dub/download/${dubJobId}/dubbed_video.mp4?preserve_bg=${preserveBg}&default_track=${defaultTrack}&include_tracks=${encodeURIComponent(tracksParam)}${burnParam}`, 'dubbed_video.mp4');
+    const q = new URLSearchParams({
+      preserve_bg: String(preserveBg),
+      default_track: defaultTrack,
+      include_tracks: tracksParam,
+    });
+    if (burnSubs) {
+      q.set('burn_subs', '1');
+      q.set('dual', dualSubs ? '1' : '0');
+      // Optional sub-position / snapshot config từ ExportModal. Có thì gửi,
+      // không thì backend dùng default (bottom, MarginV=20, FontSize=24).
+      if (opts.sub_snapshot_id) q.set('sub_snapshot_id', opts.sub_snapshot_id);
+      if (opts.sub_position) q.set('sub_position', opts.sub_position);
+      if (opts.sub_margin_v != null) q.set('sub_margin_v', String(opts.sub_margin_v));
+      if (opts.sub_font_size != null) q.set('sub_font_size', String(opts.sub_font_size));
+      if (opts.sub_bg_color) q.set('sub_bg_color', opts.sub_bg_color);
+      if (opts.sub_bg_opacity != null) q.set('sub_bg_opacity', String(opts.sub_bg_opacity));
+    }
+    triggerDownload(`${API}/dub/download/${dubJobId}/dubbed_video.mp4?${q.toString()}`, 'dubbed_video.mp4');
   };
   const handleDubAudioDownload = async () => {
     await finalizeTtsBeforeExport();

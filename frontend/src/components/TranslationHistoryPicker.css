@@ -1,0 +1,256 @@
+.tr-history-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.tr-history-picker__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  background: transparent;
+  color: var(--chrome-fg);
+  border: 1px solid var(--chrome-border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+}
+.tr-history-picker__btn:hover:not(:disabled) {
+  background: var(--chrome-hover-bg);
+  border-color: var(--chrome-border-strong);
+}
+.tr-history-picker__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.tr-history-picker__btn--sm { padding: 3px 8px; font-size: 11.5px; }
+
+.tr-history-picker__caret {
+  transition: transform var(--dur-fast);
+}
+.tr-history-picker__caret.is-open { transform: rotate(180deg); }
+
+.tr-history-picker__menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  width: 320px;
+  max-height: 400px;
+  display: flex;
+  flex-direction: column;
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 100;
+  overflow: hidden;
+}
+
+/* Portal variant — render in body, positioned via JS getBoundingClientRect.
+   Escapes any ancestor with overflow:hidden / contain that would clip the
+   default absolute-positioned menu. */
+.tr-history-picker__menu--portal {
+  position: fixed;
+  right: auto;
+  top: 0;
+  left: 0;
+  z-index: 9999;
+}
+
+.tr-history-picker__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--chrome-border);
+  background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+}
+.tr-history-picker__count {
+  font-size: 11px;
+  color: var(--chrome-fg-muted);
+}
+
+.tr-history-picker__empty {
+  padding: 16px 12px;
+  font-size: 12px;
+  color: var(--chrome-fg-muted);
+  text-align: center;
+}
+
+.tr-history-picker__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.tr-history-picker__item {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  border-radius: 6px;
+  transition: background var(--dur-fast);
+}
+.tr-history-picker__item:hover {
+  background: var(--chrome-hover-bg);
+}
+
+.tr-history-picker__row {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: stretch;
+  text-align: left;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  color: var(--chrome-fg);
+  cursor: pointer;
+  font-family: inherit;
+  border-radius: 6px;
+}
+.tr-history-picker__row:disabled { cursor: progress; opacity: 0.6; }
+
+.tr-history-picker__row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.tr-history-picker__lang {
+  font-weight: 600;
+  background: rgba(211, 134, 155, 0.18);
+  color: var(--accent, #d3869b);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--chrome-font-mono);
+  font-size: 11px;
+}
+.tr-history-picker__meta {
+  color: var(--chrome-fg);
+}
+
+.tr-history-picker__row-sub {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--chrome-fg-muted);
+}
+
+.tr-history-picker__row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 6px;
+}
+
+.tr-history-picker__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px; height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--chrome-fg-muted);
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+.tr-history-picker__icon-btn:hover {
+  background: rgba(255,255,255,0.06);
+  color: var(--chrome-fg);
+}
+.tr-history-picker__icon-btn--danger:hover {
+  color: #fb4934;
+}
+
+.tr-history-picker__loading {
+  font-size: 14px;
+  color: var(--chrome-fg-muted);
+  padding: 0 8px;
+}
+
+/* Toolbar wrapper above the segments table */
+.dub-segments-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding: 6px 4px 8px;
+}
+
+.dub-transcript-io {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: auto;
+}
+.dub-transcript-io__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  background: transparent;
+  color: var(--chrome-fg);
+  border: 1px solid var(--chrome-border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+}
+.dub-transcript-io__btn:hover:not(:disabled) {
+  background: var(--chrome-hover-bg);
+  border-color: var(--chrome-border-strong);
+}
+.dub-transcript-io__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* TimelineRebalanceBar */
+.timeline-rebalance-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--chrome-border);
+  border-radius: 8px;
+}
+.timeline-rebalance-bar__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--chrome-fg-muted);
+  padding-right: 4px;
+}
+.timeline-rebalance-bar__apply {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  background: var(--accent, #d3869b);
+  color: #1d2021;
+  border: 1px solid var(--accent, #d3869b);
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: opacity var(--dur-fast);
+}
+.timeline-rebalance-bar__apply:hover:not(:disabled) {
+  opacity: 0.88;
+}
+.timeline-rebalance-bar__apply:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

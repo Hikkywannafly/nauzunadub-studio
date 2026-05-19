@@ -1,17 +1,23 @@
 import os
 import re
 import time
+import uuid
 import random
 import asyncio
 import logging
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from schemas.requests import TranslateRequest
 from services.model_manager import _cpu_pool, _gpu_pool
 from services.translator import cinematic_available, cinematic_refine_many
-from api.routers.dub_core import _get_job
+from api.routers.dub_core import _get_job, _save_job
+
+# Cap snapshot list per job — older entries get pruned. Keeps job_data JSON
+# small enough that the SQLite blob doesn't bloat unboundedly.
+_MAX_TRANSLATION_SNAPSHOTS = 10
+_MAX_TIMELINE_SNAPSHOTS = 5
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.api")
@@ -247,6 +253,17 @@ async def shorten_segment(payload: dict):
         "attempts": result.get("attempts", 0),
         "error": result.get("error"),
     }
+
+
+@router.post("/dub/segment/optimize")
+async def optimize_segment(payload: dict):
+    """Optimize 1 segment cho khớp slot — bidirectional.
+
+    Cùng cơ chế với `/dub/segment/shorten` (dùng `adjust_for_slot` two-way),
+    nhưng tên rõ hơn: vượt slot → rút gọn, ngắn slot → expand. Frontend bind
+    nút "Optimize" với endpoint này.
+    """
+    return await shorten_segment(payload)
 
 
 @router.post("/dub/segment/rate-check")
@@ -733,15 +750,323 @@ async def _post_process_translate(translated, req, src_lang, loop):
 
     translated = await _apply_slot_fit(translated, req, src_lang)
 
+    # Persist into job (snapshot + apply to current segments) so:
+    #   1. F5 → frontend re-hydrates from dub_history with translations intact
+    #   2. User can pick a past translation back via the snapshot picker
+    snapshot_id = _persist_translation_snapshot(req, translated, src_lang, quality)
+
     resp = {
         "translated": translated,
         "target_lang": req.target_lang,
         "source_lang": src_lang,
         "quality_used": "cinematic" if (quality == "cinematic" and not cinematic_skipped) else "fast",
     }
+    if snapshot_id:
+        resp["snapshot_id"] = snapshot_id
     if cinematic_skipped:
         resp["cinematic_skipped"] = cinematic_skipped
     return resp
+
+
+def _persist_translation_snapshot(req, translated: list[dict], src_lang: str, quality: str) -> Optional[str]:
+    """Apply translated text to job["segments"] and append a snapshot entry.
+
+    Returns the snapshot id, or None if no job_id was supplied (legacy callers
+    or one-off rate-fit tests). Failures are logged and swallowed — translate
+    response stays usable even if persistence breaks.
+    """
+    job_id = getattr(req, "job_id", None)
+    if not job_id:
+        return None
+    try:
+        job = _get_job(job_id)
+        if not job:
+            return None
+
+        by_id: dict[str, dict] = {str(row["id"]): row for row in translated}
+        segments = job.get("segments") or []
+        applied = 0
+        for seg in segments:
+            sid = str(seg.get("id", ""))
+            row = by_id.get(sid)
+            if not row:
+                continue
+            new_text = (row.get("text") or "").strip()
+            if not new_text or row.get("error"):
+                continue
+            # Preserve the original on the first translate so the row can be
+            # restored later — frontend looks at text_original to detect "this
+            # segment has been translated" too.
+            if not seg.get("text_original"):
+                seg["text_original"] = seg.get("text") or ""
+            seg["text"] = new_text
+            if row.get("literal"):
+                seg["translate_literal"] = row["literal"]
+            if row.get("critique"):
+                seg["translate_critique"] = row["critique"]
+            if row.get("error"):
+                seg["translate_error"] = row["error"]
+            else:
+                seg.pop("translate_error", None)
+            applied += 1
+        job["segments"] = segments
+
+        # Don't pollute the picker with a "snapshot of nothing" — if every row
+        # errored (or returned empty), the rows wouldn't help restore anyway.
+        # Still persist the segment text update above (no-op here), just skip
+        # the history entry.
+        if applied == 0:
+            _save_job(job_id, job)
+            return None
+
+        # Snapshot — store only id+text per row; full seg state lives in
+        # job["segments"]. Restore re-applies these texts onto current segs.
+        snap_id = f"tr_{uuid.uuid4().hex[:10]}"
+        snapshot = {
+            "id": snap_id,
+            "created_at": time.time(),
+            "target_lang": req.target_lang,
+            "source_lang": src_lang,
+            "provider": (req.provider or "").lower() or None,
+            "quality": quality,
+            "genre": getattr(req, "genre", None) or None,
+            "segments_count": applied,
+            "applied_count": applied,
+            "total_count": len(translated),
+            "rows": [
+                {
+                    "id": str(row["id"]),
+                    "text": row.get("text", ""),
+                    **({"literal": row["literal"]} if row.get("literal") else {}),
+                    **({"error": row["error"]} if row.get("error") else {}),
+                }
+                for row in translated
+            ],
+        }
+        snapshots = list(job.get("translations") or [])
+        snapshots.append(snapshot)
+        # Keep newest N — prune from the front.
+        if len(snapshots) > _MAX_TRANSLATION_SNAPSHOTS:
+            snapshots = snapshots[-_MAX_TRANSLATION_SNAPSHOTS:]
+        job["translations"] = snapshots
+
+        _save_job(job_id, job)
+        return snap_id
+    except Exception as e:
+        logger.warning("translation snapshot persist failed for job %s: %s", job_id, e)
+        return None
+
+
+@router.get("/dub/translations/{job_id}")
+async def list_translation_snapshots(job_id: str):
+    """Return saved translation snapshots for this job, newest first."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = list(job.get("translations") or [])
+    # Strip heavy `rows` from the list response — picker only needs metadata.
+    def _summary(s: dict) -> dict:
+        return {k: v for k, v in s.items() if k != "rows"}
+    return {"snapshots": [_summary(s) for s in reversed(snaps)]}
+
+
+@router.get("/dub/translations/{job_id}/{snap_id}")
+async def get_translation_snapshot(job_id: str, snap_id: str):
+    """Return full snapshot including `rows[]` — frontend dùng cho preview
+    subtitle (lookup text theo seg id) mà không cần restore vào segments."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = job.get("translations") or []
+    snap = next((s for s in snaps if s.get("id") == snap_id), None)
+    if not snap:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return snap
+
+
+@router.post("/dub/translations/{job_id}/restore/{snap_id}")
+async def restore_translation_snapshot(job_id: str, snap_id: str):
+    """Re-apply a snapshot's translations onto job["segments"] and return the
+    refreshed segment list. No-op for ids that don't match a saved snapshot.
+    """
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = job.get("translations") or []
+    target = next((s for s in snaps if s.get("id") == snap_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    by_id = {str(r["id"]): r for r in (target.get("rows") or [])}
+    segments = job.get("segments") or []
+    applied = 0
+    skipped_errors = 0
+    for seg in segments:
+        row = by_id.get(str(seg.get("id", "")))
+        if not row:
+            continue
+        # Skip rows that captured a translate failure — their `text` is the
+        # original source (passthrough), so restoring would undo any successful
+        # translation currently on the seg. Mirrors the persist logic which
+        # also skips errored rows when applying.
+        if row.get("error"):
+            skipped_errors += 1
+            continue
+        new_text = (row.get("text") or "").strip()
+        if not new_text:
+            continue
+        if not seg.get("text_original"):
+            seg["text_original"] = seg.get("text") or ""
+        seg["text"] = new_text
+        if row.get("literal"):
+            seg["translate_literal"] = row["literal"]
+        seg.pop("translate_error", None)
+        applied += 1
+    job["segments"] = segments
+    _save_job(job_id, job)
+    return {
+        "applied": applied,
+        "skipped_errors": skipped_errors,
+        "segments": segments,
+        "snapshot_id": snap_id,
+    }
+
+
+# ── Timeline rebalance ───────────────────────────────────────────────────
+
+@router.post("/dub/timeline/rebalance/{job_id}")
+async def rebalance_timeline(job_id: str, payload: dict):
+    """Redistribute segment start/end để chars-per-second đều xuyên suốt.
+
+    Body:
+      { "mode": "even" | "ai",
+        "max_drift_s": 1.5  // optional, even mode only
+      }
+
+    Trước khi apply, snapshot current `start/end` (per seg) vào
+    job["timeline_snapshots"] để user revert được. Trả new segments + stats.
+    """
+    from services.timeline_rebalance import rebalance_even, rebalance_ai, cps_summary
+
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    segs = job.get("segments") or []
+    if not segs:
+        return {"segments": [], "stats": {"runs": 0, "shifted": 0}}
+
+    mode = (payload.get("mode") or "even").lower()
+    lang_code = job.get("language_code") or "en"
+
+    before_stats = cps_summary(segs, lang_code)
+
+    if mode == "ai":
+        new_segs, stats = rebalance_ai(segs)
+    else:
+        max_drift = float(payload.get("max_drift_s") or 1.5)
+        new_segs, stats = rebalance_even(segs, max_drift_s=max_drift)
+        stats["mode"] = "even"
+
+    after_stats = cps_summary(new_segs, lang_code)
+
+    # Snapshot current (pre-rebalance) timings before mutating
+    snap_id = f"tl_{uuid.uuid4().hex[:10]}"
+    snapshot = {
+        "id": snap_id,
+        "created_at": time.time(),
+        "mode": stats.get("mode", mode),
+        "timings": [
+            {"id": str(s.get("id", i)),
+             "start": float(s.get("start") or 0.0),
+             "end": float(s.get("end") or 0.0)}
+            for i, s in enumerate(segs)
+        ],
+    }
+    snapshots = list(job.get("timeline_snapshots") or [])
+    snapshots.append(snapshot)
+    if len(snapshots) > _MAX_TIMELINE_SNAPSHOTS:
+        snapshots = snapshots[-_MAX_TIMELINE_SNAPSHOTS:]
+    job["timeline_snapshots"] = snapshots
+    job["segments"] = new_segs
+    _save_job(job_id, job)
+
+    return {
+        "segments": new_segs,
+        "snapshot_id": snap_id,
+        "stats": stats,
+        "before": before_stats,
+        "after": after_stats,
+    }
+
+
+@router.get("/dub/timeline/snapshots/{job_id}")
+async def list_timeline_snapshots(job_id: str):
+    """Liệt kê timeline snapshots (chỉ metadata, không kèm `timings`)."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = list(job.get("timeline_snapshots") or [])
+    def _summary(s: dict) -> dict:
+        return {k: v for k, v in s.items() if k != "timings"}
+    return {"snapshots": [_summary(s) for s in reversed(snaps)]}
+
+
+@router.post("/dub/timeline/restore/{job_id}/{snap_id}")
+async def restore_timeline_snapshot(job_id: str, snap_id: str):
+    """Revert start/end về snapshot. Giữ nguyên text + các field khác."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = job.get("timeline_snapshots") or []
+    target = next((s for s in snaps if s.get("id") == snap_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    by_id = {str(t["id"]): t for t in (target.get("timings") or [])}
+    segs = job.get("segments") or []
+    restored = 0
+    for seg in segs:
+        t = by_id.get(str(seg.get("id", "")))
+        if not t:
+            continue
+        seg["start"] = float(t["start"])
+        seg["end"] = float(t["end"])
+        restored += 1
+    job["segments"] = segs
+    _save_job(job_id, job)
+    return {"restored": restored, "segments": segs, "snapshot_id": snap_id}
+
+
+@router.delete("/dub/timeline/snapshots/{job_id}/{snap_id}")
+async def delete_timeline_snapshot(job_id: str, snap_id: str):
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = job.get("timeline_snapshots") or []
+    before = len(snaps)
+    snaps = [s for s in snaps if s.get("id") != snap_id]
+    if len(snaps) == before:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    job["timeline_snapshots"] = snaps
+    _save_job(job_id, job)
+    return {"deleted": True, "remaining": len(snaps)}
+
+
+@router.delete("/dub/translations/{job_id}/{snap_id}")
+async def delete_translation_snapshot(job_id: str, snap_id: str):
+    """Remove a saved snapshot. Does not touch current job["segments"]."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    snaps = job.get("translations") or []
+    before = len(snaps)
+    snaps = [s for s in snaps if s.get("id") != snap_id]
+    if len(snaps) == before:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    job["translations"] = snaps
+    _save_job(job_id, job)
+    return {"deleted": True, "remaining": len(snaps)}
 
 
 # Backward-compat alias — older callers / tests may still import this name.

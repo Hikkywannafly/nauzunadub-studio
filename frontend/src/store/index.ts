@@ -31,8 +31,10 @@ import type { PillSlice } from './pillSlice';
 import { createPillSlice } from './pillSlice';
 import type { VoiceSlice } from './voiceSlice';
 import { createVoiceSlice } from './voiceSlice';
+import type { DubSettingsSlice } from './dubSettingsSlice';
+import { createDubSettingsSlice } from './dubSettingsSlice';
 
-export type AppStore = PrefsSlice & GlossarySlice & UiSlice & DubSlice & GenerateSlice & PillSlice & VoiceSlice;
+export type AppStore = PrefsSlice & GlossarySlice & UiSlice & DubSlice & GenerateSlice & PillSlice & VoiceSlice & DubSettingsSlice;
 
 /**
  * `useAppStore` — single root store. Don't create siblings. Slices compose here.
@@ -51,6 +53,7 @@ export const useAppStore = create<AppStore>()(
       ...createGenerateSlice(set, get, api),
       ...createPillSlice(set, get, api),
       ...createVoiceSlice(set, get, api),
+      ...createDubSettingsSlice(set, get, api),
     }),
     {
       name: 'videodub.app',
@@ -88,18 +91,19 @@ export const useAppStore = create<AppStore>()(
         denoise:       s.denoise,
         postprocess:   s.postprocess,
         vdStates:      s.vdStates,
+        // Dub mix-time tuning — power-user knobs persist per browser.
+        dubSettings:   s.dubSettings,
       }),
-      version: 3,
+      version: 4,
       // Drop old persisted shapes rather than crashing the app. Every field
       // has a safe default in its slice, so v1/v2 users pick up v3 defaults
       // for the new fields (mode, uiScale, generate knobs, etc.) and keep
       // any keys we still write today. Upgrade > crash.
       migrate: (persisted, version) => {
         if (!persisted || typeof persisted !== 'object') return {} as Partial<AppStore>;
-        if (version < 3) {
-          // v1 → v2 added reviewMode; v2 → v3 added mode/sidebar/generate knobs.
-          // All of those have slice defaults, so passing through the old keys
-          // is sufficient — anything missing falls through to the slice init.
+        if (version < 4) {
+          // v3 → v4 added dubSettings (mix-time tuning knobs). Slice default
+          // covers missing keys, so passing through is safe.
           return persisted as Partial<AppStore>;
         }
         return persisted as Partial<AppStore>;

@@ -4,13 +4,14 @@ import time
 import uuid
 import asyncio
 import logging
-from fastapi import APIRouter, HTTPException, Query, Response
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 
 from core.db import db_conn
 from core.config import DUB_DIR
 from core.tasks import task_manager
-from api.routers.dub_core import _get_job
+from api.routers.dub_core import _get_job, _save_job
 from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
 
 router = APIRouter()
@@ -158,13 +159,17 @@ async def dub_list_tracks(job_id: str):
     return {"tracks": job.get("dubbed_tracks", {})}
 
 
-def _write_burn_srt(job: dict, exports_dir: str, stamp: str, dual: bool) -> str | None:
+def _write_burn_srt(
+    job: dict, exports_dir: str, stamp: str, dual: bool,
+    snapshot_id: Optional[str] = None,
+) -> str | None:
     """Build a temp SRT from job segments for use with ffmpeg's subtitles filter.
 
     Returned path is already ffmpeg-filter-safe (plain ASCII basename under exports_dir).
-    Returns None if there are no segments to render.
+    Returns None if there are no segments to render. `snapshot_id` lets the
+    burn-in pick a non-current translation language.
     """
-    segments = job.get("segments", [])
+    segments = _resolve_subtitle_segments(job, snapshot_id)
     if not segments:
         return None
     lines = []
@@ -177,6 +182,166 @@ def _write_burn_srt(job: dict, exports_dir: str, stamp: str, dual: bool) -> str 
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return sub_path
+
+
+# ASS alignment numpad: 1-3 bottom row, 4-6 middle, 7-9 top
+# Default = 2 (bottom-center, what most viewers expect).
+_SUB_ALIGN_MAP = {
+    "bottom": 2,
+    "top": 8,
+    "middle": 5,
+}
+
+
+def _hex_to_ass_color(hex_str: str, opacity_pct: int) -> str:
+    """Convert `#RRGGBB` + opacity 0-100 → ASS color literal `&HAABBGGRR`.
+
+    ASS dùng BGR order + AA là *transparency* (00 = đục, FF = trong suốt).
+    Opacity 100% → AA = 00 (fully opaque). Opacity 0% → AA = FF (invisible).
+    """
+    s = (hex_str or "#000000").lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        s = "000000"
+    try:
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+    except ValueError:
+        r = g = b = 0
+    op = max(0, min(100, int(opacity_pct)))
+    # ASS alpha: 00 = opaque, FF = transparent. Invert from opacity %.
+    aa = round((100 - op) * 255 / 100)
+    return f"&H{aa:02X}{b:02X}{g:02X}{r:02X}"
+
+
+def _build_burn_style(
+    position: str,
+    margin_v: int,
+    font_size: int,
+    bg_color: str = "",
+    bg_opacity: int = 0,
+) -> str:
+    """Build an ffmpeg `force_style` string for the subtitles filter.
+
+    Khi `bg_opacity > 0`, switch `BorderStyle=3` (opaque box) và set
+    `BackColour` từ hex + opacity. Khi 0 → BorderStyle=1 (outline-only,
+    text-shadow style như default).
+    """
+    align = _SUB_ALIGN_MAP.get((position or "bottom").lower(), 2)
+    margin = max(0, min(500, int(margin_v)))
+    size = max(10, min(80, int(font_size)))
+    parts = [f"Alignment={align}", f"MarginV={margin}", f"FontSize={size}"]
+    if bg_color and int(bg_opacity) > 0:
+        ass_bg = _hex_to_ass_color(bg_color, bg_opacity)
+        # BorderStyle=3 → opaque rectangular background; Outline = padding around text.
+        parts += ["BorderStyle=3", f"BackColour={ass_bg}", "Outline=4", "Shadow=0"]
+    return ",".join(parts)
+
+
+# ── Custom background audio ─────────────────────────────────────────────
+
+_ALLOWED_BG_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".opus"}
+
+
+def _resolve_bg(job: dict, bg_source: str) -> Optional[str]:
+    """Map bg_source → audio file path. None khi 'off' hoặc thiếu file."""
+    src = (bg_source or "original").lower()
+    if src == "off":
+        return None
+    if src == "custom":
+        p = job.get("custom_bg_path")
+        return p if (p and os.path.exists(p)) else None
+    # "original" (default) → Demucs no-vocals stem
+    p = job.get("no_vocals_path")
+    return p if (p and os.path.exists(p)) else None
+
+
+def _amix_weights(bg_volume: float) -> str:
+    """Build ffmpeg amix `weights` string from a 0-2.0 BG volume slider.
+
+    Voice giữ ổn định ở 1.2 (≈ +1.6 dB headroom). BG nhân theo slider, clamp
+    để tránh đè giọng (0.0–2.0 → 0.0–2.0).
+    """
+    bg = max(0.0, min(2.0, float(bg_volume)))
+    return f"{bg:.2f} 1.2"
+
+
+@router.post("/dub/bg/{job_id}")
+async def upload_custom_bg(job_id: str, file: UploadFile = File(...)):
+    """Upload a custom background audio file. Replaces previous custom BG."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _ALLOWED_BG_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Định dạng {ext or '(rỗng)'} không hỗ trợ. Dùng wav/mp3/m4a/aac/ogg/flac/opus.",
+        )
+    try:
+        raw = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Đọc file thất bại: {e}") from e
+    if not raw:
+        raise HTTPException(status_code=400, detail="File rỗng")
+
+    bg_dir = os.path.join(DUB_DIR, job_id, "exports")
+    os.makedirs(bg_dir, exist_ok=True)
+    # Cleanup previous custom BG nếu khác extension (tránh tích file cũ)
+    prev = job.get("custom_bg_path")
+    if prev and os.path.exists(prev) and prev != os.path.join(bg_dir, f"custom_bg{ext}"):
+        try:
+            os.remove(prev)
+        except OSError:
+            pass
+    bg_path = os.path.join(bg_dir, f"custom_bg{ext}")
+    with open(bg_path, "wb") as f:
+        f.write(raw)
+
+    job["custom_bg_path"] = bg_path
+    job["custom_bg_filename"] = file.filename or os.path.basename(bg_path)
+    _save_job(job_id, job)
+    return {
+        "ok": True,
+        "filename": job["custom_bg_filename"],
+        "size_bytes": len(raw),
+    }
+
+
+@router.get("/dub/bg/{job_id}")
+async def get_custom_bg_info(job_id: str):
+    """Return metadata về custom BG đang được lưu (nếu có)."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    p = job.get("custom_bg_path")
+    if not p or not os.path.exists(p):
+        return {"exists": False}
+    return {
+        "exists": True,
+        "filename": job.get("custom_bg_filename") or os.path.basename(p),
+        "size_bytes": os.path.getsize(p),
+    }
+
+
+@router.delete("/dub/bg/{job_id}")
+async def delete_custom_bg(job_id: str):
+    """Remove the stored custom BG file + clear pointer in job."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    p = job.get("custom_bg_path")
+    if p and os.path.exists(p):
+        try:
+            os.remove(p)
+        except OSError as e:
+            logger.warning("custom_bg cleanup failed for %s: %s", job_id, e)
+    job.pop("custom_bg_path", None)
+    job.pop("custom_bg_filename", None)
+    _save_job(job_id, job)
+    return {"deleted": True}
 
 
 def _ffmpeg_filter_escape(path: str) -> str:
@@ -192,12 +357,20 @@ def _ffmpeg_filter_escape(path: str) -> str:
 @router.get("/dub/download/{job_id}/{filename}")
 async def dub_download(
     job_id: str,
-    preserve_bg: bool = Query(True, description="Mix background noise into dubbed tracks"),
+    preserve_bg: bool = Query(True, description="Legacy: bật/tắt BG. Khi bg_source được truyền, param này bị bỏ qua."),
+    bg_source: Optional[str] = Query(None, description="original | custom | off. Override preserve_bg."),
+    bg_volume: float = Query(0.8, description="BG volume multiplier (0.0–2.0). Default 0.8 = nhẹ dưới giọng."),
     default_track: str = Query("original"),
     include_tracks: str = Query("", description="Comma-separated list of tracks to include (e.g. 'original,de,es'). Empty = include all."),
     save_path: str = Query("", description="Absolute destination path. If set, mux output is copied there and JSON returned instead of FileResponse."),
     burn_subs: bool = Query(False, description="Burn subtitles into the video stream (forces re-encode). Uses dual-subtitle layout when dual=1."),
     dual: bool = Query(False, description="When burn_subs=1, render translated on top of italicised original."),
+    sub_snapshot_id: Optional[str] = Query(None, description="Translation snapshot id để chọn ngôn ngữ sub burn-in."),
+    sub_position: str = Query("bottom", description="bottom | middle | top — vị trí dọc của burn-in subtitle."),
+    sub_margin_v: int = Query(20, description="Margin từ cạnh anchor (pixel). 0-500."),
+    sub_font_size: int = Query(24, description="Font size cho burn-in. 10-80."),
+    sub_bg_color: str = Query("", description="Hex màu nền sub (#RRGGBB). Rỗng = không có nền."),
+    sub_bg_opacity: int = Query(0, description="Opacity nền sub 0-100%. 0 = không có nền."),
 ):
     job = _get_job(job_id)
     if not job:
@@ -225,14 +398,17 @@ async def dub_download(
     output_path = os.path.join(exports_dir, f"dubbed_video_{stamp}.mp4")
     ffmpeg = find_ffmpeg()
 
-    sub_path = _write_burn_srt(job, exports_dir, stamp, dual) if burn_subs else None
+    sub_path = _write_burn_srt(job, exports_dir, stamp, dual, sub_snapshot_id) if burn_subs else None
 
     cmd = [ffmpeg, "-i", video_path]
     input_idx = 1
 
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
+    # Resolve BG: explicit bg_source wins over legacy preserve_bg toggle. Khi
+    # bg_source = None thì fallback về preserve_bg (giữ tương thích client cũ).
+    effective_source = bg_source or ("original" if preserve_bg else "off")
+    bg_audio = _resolve_bg(job, effective_source)
     bg_idx = None
-    if bg_audio and os.path.exists(bg_audio) and filtered_tracks:
+    if bg_audio and filtered_tracks:
         cmd += ["-i", bg_audio]
         bg_idx = input_idx
         input_idx += 1
@@ -247,7 +423,8 @@ async def dub_download(
     video_map = "0:v:0"
     if sub_path:
         esc = _ffmpeg_filter_escape(sub_path)
-        filter_parts.append(f"[0:v]subtitles='{esc}'[vout]")
+        style = _build_burn_style(sub_position, sub_margin_v, sub_font_size, sub_bg_color, sub_bg_opacity)
+        filter_parts.append(f"[0:v]subtitles='{esc}':force_style='{style}'[vout]")
         video_map = "[vout]"
 
     cmd += ["-map", video_map]
@@ -255,9 +432,10 @@ async def dub_download(
         cmd += ["-map", "0:a:0"]
 
     if bg_idx is not None:
+        weights = _amix_weights(bg_volume)
         for i, t in enumerate(tracks_to_process):
             out_label = f"[aout{i}]"
-            filter_parts.append(f"[{bg_idx}:a][{t['idx']}:a]amix=inputs=2:duration=longest:dropout_transition=2:weights=0.8 1.2{out_label}")
+            filter_parts.append(f"[{bg_idx}:a][{t['idx']}:a]amix=inputs=2:duration=longest:dropout_transition=2:weights={weights}{out_label}")
             t["out_label"] = out_label
         for t in tracks_to_process:
             cmd += ["-map", t["out_label"]]
@@ -466,7 +644,14 @@ async def dub_preview_segment(job_id: str, segment_index: int):
 
 @router.get("/dub/download-audio/{job_id}")
 @router.get("/dub/download-audio/{job_id}/{filename}")
-async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: bool = Query(True), save_path: str = Query("")):
+async def dub_download_audio(
+    job_id: str,
+    lang: str = Query(None),
+    preserve_bg: bool = Query(True),
+    bg_source: Optional[str] = Query(None),
+    bg_volume: float = Query(0.8),
+    save_path: str = Query(""),
+):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -487,13 +672,15 @@ async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: 
     exports_dir = os.path.join(DUB_DIR, job_id, "exports")
     os.makedirs(exports_dir, exist_ok=True)
 
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
-    if bg_audio and os.path.exists(bg_audio):
+    effective_source = bg_source or ("original" if preserve_bg else "off")
+    bg_audio = _resolve_bg(job, effective_source)
+    if bg_audio:
         ffmpeg = find_ffmpeg()
         final_audio_path = os.path.join(exports_dir, f"mixed_dub_{lang_label}_{stamp}.wav")
+        weights = _amix_weights(bg_volume)
         cmd = [
             ffmpeg, "-i", bg_audio, "-i", wav_path,
-            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2:weights=0.8 1.2[aout]",
+            "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2:weights={weights}[aout]",
             "-map", "[aout]", "-c:a", "pcm_s16le", "-y", final_audio_path
         ]
         try:
@@ -541,14 +728,50 @@ def _pick_subtitle_text(seg: dict, dual: bool) -> str:
     return f"{translated}\n<i>{original}</i>"
 
 
+def _resolve_subtitle_segments(job: dict, snapshot_id: Optional[str]) -> list[dict]:
+    """Build the list of segments to render as subtitle cues.
+
+    Default = current `job["segments"]` (latest applied translation).
+    Khi `snapshot_id` được truyền → overlay snapshot rows lên seg metadata
+    (giữ start/end + text_original), thay text bằng snapshot rows.text. Cho
+    phép xuất sub ở bất kỳ ngôn ngữ nào user đã từng dịch, không cần phải
+    restore snapshot vào segments hiện tại.
+    """
+    segments = job.get("segments") or []
+    if not snapshot_id:
+        return segments
+    snaps = job.get("translations") or []
+    snap = next((s for s in snaps if s.get("id") == snapshot_id), None)
+    if not snap:
+        return segments
+    by_id = {str(r.get("id")): r for r in (snap.get("rows") or [])}
+    out: list[dict] = []
+    for seg in segments:
+        row = by_id.get(str(seg.get("id", "")))
+        if not row or row.get("error"):
+            # Snapshot không có hoặc lỗi → fall back về text hiện tại
+            out.append(seg)
+            continue
+        new_text = (row.get("text") or "").strip()
+        if not new_text:
+            out.append(seg)
+            continue
+        out.append({**seg, "text": new_text})
+    return out
+
+
 @router.get("/dub/srt/{job_id}")
 @router.get("/dub/srt/{job_id}/{filename}")
-async def dub_export_srt(job_id: str, dual: bool = False):
+async def dub_export_srt(
+    job_id: str,
+    dual: bool = False,
+    snapshot_id: Optional[str] = Query(None, description="Translation snapshot id để chọn ngôn ngữ sub (default = current segments)"),
+):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    segments = job.get("segments", [])
+    segments = _resolve_subtitle_segments(job, snapshot_id)
     if not segments:
         raise HTTPException(status_code=400, detail="No transcript segments available")
 
@@ -579,12 +802,16 @@ def _format_vtt_time(seconds):
 
 @router.get("/dub/vtt/{job_id}")
 @router.get("/dub/vtt/{job_id}/{filename}")
-async def dub_export_vtt(job_id: str, dual: bool = False):
+async def dub_export_vtt(
+    job_id: str,
+    dual: bool = False,
+    snapshot_id: Optional[str] = Query(None, description="Translation snapshot id để chọn ngôn ngữ sub"),
+):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    segments = job.get("segments", [])
+    segments = _resolve_subtitle_segments(job, snapshot_id)
     if not segments:
         raise HTTPException(status_code=400, detail="No transcript segments available")
 
@@ -640,7 +867,15 @@ async def dub_export_segments_zip(job_id: str):
 
 @router.get("/dub/download-mp3/{job_id}")
 @router.get("/dub/download-mp3/{job_id}/{filename}")
-async def dub_download_mp3(job_id: str, lang: str = Query(None), preserve_bg: bool = Query(True), save_path: str = Query(""), bitrate: str = Query("192k")):
+async def dub_download_mp3(
+    job_id: str,
+    lang: str = Query(None),
+    preserve_bg: bool = Query(True),
+    bg_source: Optional[str] = Query(None),
+    bg_volume: float = Query(0.8),
+    save_path: str = Query(""),
+    bitrate: str = Query("192k"),
+):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -663,12 +898,14 @@ async def dub_download_mp3(job_id: str, lang: str = Query(None), preserve_bg: bo
     os.makedirs(exports_dir, exist_ok=True)
 
     source_path = wav_path
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
-    if bg_audio and os.path.exists(bg_audio):
+    effective_source = bg_source or ("original" if preserve_bg else "off")
+    bg_audio = _resolve_bg(job, effective_source)
+    if bg_audio:
         mixed_path = os.path.join(exports_dir, f"mixed_mp3_{lang_label}_{stamp}.wav")
+        weights = _amix_weights(bg_volume)
         cmd_mix = [
             ffmpeg, "-i", bg_audio, "-i", wav_path,
-            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2:weights=0.8 1.2[aout]",
+            "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2:weights={weights}[aout]",
             "-map", "[aout]", "-c:a", "pcm_s16le", "-y", mixed_path
         ]
         try:

@@ -5,6 +5,8 @@ import {
   Check, Globe, Zap, X, Building2,
 } from 'lucide-react';
 import { Button, Segmented, Badge } from '../ui';
+import { listTranslationSnapshots, uploadCustomBg, getCustomBgInfo, deleteCustomBg } from '../api/dub';
+import SubtitlePreview from './SubtitlePreview';
 import './ExportModal.css';
 
 /**
@@ -48,11 +50,79 @@ export default function ExportModal({
   const [audioPrimaryLang, setAudioPrimaryLang] = useState(dubLangCode || '');
   const [subsFormat, setSubsFormat] = useState('srt');     // srt | vtt | both
   const [subsDual, setSubsDual] = useState(!!dualSubs);
-  const [subsBatch, setSubsBatch] = useState('target');    // target | all-dubs
+  const [subsBatch, setSubsBatch] = useState('target');    // target | all-dubs | snapshot
+  // Translation snapshots — cho phép user xuất sub theo bất kỳ bản dịch nào
+  // đã làm trong cùng video. Khi rỗng → ẩn picker, fall về 'target' / 'all-dubs'.
+  const [translationSnapshots, setTranslationSnapshots] = useState([]);
+  const [subsSnapshotId, setSubsSnapshotId] = useState('');
+  // Burn-in position config (chỉ dùng khi burnSubs=true)
+  const [subPosition, setSubPosition] = useState('bottom'); // bottom | middle | top
+  const [subMarginV, setSubMarginV] = useState(20);
+  const [subFontSize, setSubFontSize] = useState(24);
+  // Subtitle background box (ASS BorderStyle=3) — off khi opacity=0
+  const [subBgColor, setSubBgColor] = useState('#000000');
+  const [subBgOpacity, setSubBgOpacity] = useState(0); // 0 = no BG box
+  // Background audio config
+  const [bgSource, setBgSource] = useState('original'); // original | custom | off
+  const [bgVolume, setBgVolume] = useState(80);         // 0-200 %, divided by 100 trên URL
+  const [customBgInfo, setCustomBgInfo] = useState({ exists: false });
+  const [uploadingBg, setUploadingBg] = useState(false);
 
   // Reflect the parent's dual/burn once, then own them locally so the modal
   // can toy with them without committing on cancel.
   useEffect(() => { setSubsDual(!!dualSubs); }, [open, dualSubs]);
+
+  // Load translation snapshots when modal opens — used để picker dropdown
+  // chọn ngôn ngữ sub. Lỗi 404 trên job mới chưa translate là bình thường.
+  useEffect(() => {
+    if (!open || !jobId) return;
+    (async () => {
+      try {
+        const res = await listTranslationSnapshots(jobId);
+        setTranslationSnapshots(res.snapshots || []);
+      } catch {
+        setTranslationSnapshots([]);
+      }
+      try {
+        const info = await getCustomBgInfo(jobId);
+        setCustomBgInfo(info);
+      } catch {
+        setCustomBgInfo({ exists: false });
+      }
+    })();
+  }, [open, jobId]);
+
+  const handleBgUpload = async () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'audio/*';
+    input.onchange = async (e) => {
+      const file = e.target.files?.[0];
+      if (!file || !jobId) return;
+      setUploadingBg(true);
+      try {
+        const res = await uploadCustomBg(jobId, file);
+        setCustomBgInfo({ exists: true, filename: res.filename, size_bytes: res.size_bytes });
+        setBgSource('custom');
+      } catch (err) {
+        alert(`Upload nhạc nền thất bại: ${err.message || err}`);
+      } finally {
+        setUploadingBg(false);
+      }
+    };
+    input.click();
+  };
+
+  const handleBgDelete = async () => {
+    if (!jobId || !customBgInfo.exists) return;
+    try {
+      await deleteCustomBg(jobId);
+      setCustomBgInfo({ exists: false });
+      if (bgSource === 'custom') setBgSource('original');
+    } catch (err) {
+      alert(`Xoá nhạc nền thất bại: ${err.message || err}`);
+    }
+  };
 
   // ── Drawer dismiss — ESC closes; click-outside closes. The drawer is a
   // bottom sheet (non-blocking), so background interactions stay live.
@@ -132,7 +202,21 @@ export default function ExportModal({
   // ── Runners — fire backend calls based on tab. Each returns quickly;
   // toasts inside triggerDownload keep the user informed.
   const runVideo = () => {
-    handleDubDownload?.();
+    const opts = {
+      bg_source: bgSource,
+      bg_volume: bgVolume / 100,
+    };
+    if (burnSubs) {
+      if (subsSnapshotId) opts.sub_snapshot_id = subsSnapshotId;
+      opts.sub_position = subPosition;
+      opts.sub_margin_v = subMarginV;
+      opts.sub_font_size = subFontSize;
+      if (subBgOpacity > 0) {
+        opts.sub_bg_color = subBgColor;
+        opts.sub_bg_opacity = subBgOpacity;
+      }
+    }
+    handleDubDownload?.(opts);
     onClose?.();
   };
   const runAudio = () => {
@@ -141,7 +225,14 @@ export default function ExportModal({
       : [audioPrimaryLang || dubLangCode];
     langs.forEach(lang => {
       if (!lang) return;
-      const q = `preserve_bg=${preserveBg ? 1 : 0}&lang=${encodeURIComponent(lang)}`;
+      const params = new URLSearchParams({
+        lang,
+        bg_source: bgSource,
+        bg_volume: String(bgVolume / 100),
+        // Legacy preserve_bg vẫn truyền để backend cũ vẫn chạy được nếu rollback.
+        preserve_bg: bgSource === 'off' ? '0' : '1',
+      });
+      const q = params.toString();
       if (audioFormat === 'wav') {
         const url = `${API}/dub/download-audio/${jobId}/dubbed_${lang}.wav?${q}`;
         handleAudioExport?.(url, `dubbed_${lang}.wav`);
@@ -153,15 +244,40 @@ export default function ExportModal({
     onClose?.();
   };
   const runSubs = () => {
-    const targets = subsBatch === 'all-dubs' ? selectedDubs.map(t => t.code) : [dubLangCode];
+    // `snapshot` mode: 1 file lấy text từ snapshot đã chọn (ngôn ngữ cụ thể)
+    // `all-dubs` : 1 file cho mỗi snapshot/track được chọn — nhưng hiện tại
+    //              backend chỉ render từ 1 snapshot/lần, nên fallback về snapshots
+    // `target` : 1 file từ current segments (legacy)
     const formats = subsFormat === 'both' ? ['srt', 'vtt'] : [subsFormat];
-    targets.forEach(lang => {
-      formats.forEach(ext => {
+    const exportOne = (lang, snapId) => {
+      formats.forEach((ext) => {
         const name = `subtitles${subsDual ? '_dual' : ''}_${lang}.${ext}`;
-        const url = `${API}/dub/${ext}/${jobId}/${name}?dual=${subsDual ? 1 : 0}`;
+        const q = new URLSearchParams({ dual: subsDual ? '1' : '0' });
+        if (snapId) q.set('snapshot_id', snapId);
+        const url = `${API}/dub/${ext}/${jobId}/${name}?${q.toString()}`;
         triggerDownload?.(url, name);
       });
-    });
+    };
+
+    if (subsBatch === 'snapshot' && subsSnapshotId) {
+      const snap = translationSnapshots.find((s) => s.id === subsSnapshotId);
+      const lang = snap?.target_lang || dubLangCode || 'sub';
+      exportOne(lang, subsSnapshotId);
+    } else if (subsBatch === 'all-dubs') {
+      // Mỗi target_lang trong snapshots → 1 file. Nếu chưa có snapshot dùng track codes.
+      if (translationSnapshots.length > 0) {
+        // Pick the newest snapshot per language
+        const byLang = new Map();
+        for (const s of translationSnapshots) {
+          if (!byLang.has(s.target_lang)) byLang.set(s.target_lang, s);
+        }
+        byLang.forEach((s, lang) => exportOne(lang, s.id));
+      } else {
+        selectedDubs.forEach((t) => exportOne(t.code, undefined));
+      }
+    } else {
+      exportOne(dubLangCode, undefined);
+    }
     onClose?.();
   };
   const runStems = () => {
@@ -267,21 +383,136 @@ export default function ExportModal({
                 </select>
               </Field>
               <Field label="Background audio">
-                <label className="export-modal__toggle">
-                  <input type="checkbox" checked={preserveBg} onChange={e => setPreserveBg(e.target.checked)} />
-                  Mix music/FX under every dubbed track
-                </label>
+                <BgControls
+                  bgSource={bgSource}
+                  setBgSource={(v) => {
+                    setBgSource(v);
+                    setPreserveBg(v !== 'off');
+                  }}
+                  bgVolume={bgVolume}
+                  setBgVolume={setBgVolume}
+                  customBgInfo={customBgInfo}
+                  uploadingBg={uploadingBg}
+                  onUpload={handleBgUpload}
+                  onDelete={handleBgDelete}
+                />
               </Field>
-              <Field label="Subtitles in video">
+              <Field
+                label="Subtitles in video"
+                className={burnSubs ? 'export-modal__field--wide' : ''}
+              >
                 <label className="export-modal__toggle">
                   <input type="checkbox" checked={burnSubs} onChange={e => setBurnSubs(e.target.checked)} />
                   Burn subtitles into picture (hardsub)
                 </label>
                 {burnSubs && (
-                  <label className="export-modal__toggle export-modal__toggle--indent">
-                    <input type="checkbox" checked={!!dualSubs} onChange={e => setDualSubs(e.target.checked)} />
-                    Dual (translated on top of italicised original)
-                  </label>
+                  <>
+                    <label className="export-modal__toggle export-modal__toggle--indent">
+                      <input type="checkbox" checked={!!dualSubs} onChange={e => setDualSubs(e.target.checked)} />
+                      Dual (translated on top of italicised original)
+                    </label>
+                    {translationSnapshots.length > 0 && (
+                      <div className="export-modal__sub-row">
+                        <label className="export-modal__sub-label">Language</label>
+                        <select
+                          className="input-base input-base--xs"
+                          value={subsSnapshotId}
+                          onChange={(e) => setSubsSnapshotId(e.target.value)}
+                        >
+                          <option value="">Current ({dubLangCode || '—'})</option>
+                          {translationSnapshots.map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {(s.target_lang || '?').toUpperCase()} · {s.provider || '—'} · {s.quality || 'fast'}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className="export-modal__sub-row">
+                      <label className="export-modal__sub-label">Position</label>
+                      <Segmented
+                        size="sm"
+                        value={subPosition}
+                        onChange={setSubPosition}
+                        items={[
+                          { value: 'bottom', label: 'Bottom' },
+                          { value: 'middle', label: 'Middle' },
+                          { value: 'top', label: 'Top' },
+                        ]}
+                      />
+                    </div>
+                    <div className="export-modal__sub-row">
+                      <label className="export-modal__sub-label">
+                        Margin <span style={{ fontFamily: 'monospace' }}>{subMarginV}px</span>
+                      </label>
+                      <input
+                        type="range" min="0" max="200" step="5"
+                        value={subMarginV}
+                        onChange={(e) => setSubMarginV(Number(e.target.value))}
+                        style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
+                      />
+                    </div>
+                    <div className="export-modal__sub-row">
+                      <label className="export-modal__sub-label">
+                        Font size <span style={{ fontFamily: 'monospace' }}>{subFontSize}pt</span>
+                      </label>
+                      <input
+                        type="range" min="12" max="60" step="2"
+                        value={subFontSize}
+                        onChange={(e) => setSubFontSize(Number(e.target.value))}
+                        style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
+                      />
+                    </div>
+                    <div className="export-modal__sub-row">
+                      <label className="export-modal__sub-label">BG color</label>
+                      <input
+                        type="color"
+                        value={subBgColor}
+                        onChange={(e) => setSubBgColor(e.target.value)}
+                        style={{
+                          width: 32, height: 28, padding: 0, border: '1px solid var(--chrome-border)',
+                          borderRadius: 4, background: 'transparent', cursor: 'pointer',
+                        }}
+                      />
+                      <span style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--chrome-fg-muted)' }}>
+                        {subBgColor}
+                      </span>
+                      <span style={{ width: 8 }} />
+                      <label className="export-modal__sub-label" style={{ minWidth: 'auto' }}>
+                        Opacity <span style={{ fontFamily: 'monospace' }}>{subBgOpacity}%</span>
+                      </label>
+                      <input
+                        type="range" min="0" max="100" step="5"
+                        value={subBgOpacity}
+                        onChange={(e) => setSubBgOpacity(Number(e.target.value))}
+                        style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
+                      />
+                      {subBgOpacity > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setSubBgOpacity(0)}
+                          style={{
+                            padding: '2px 8px', fontSize: 11, background: 'transparent',
+                            color: 'var(--chrome-fg-muted)', border: '1px solid var(--chrome-border)',
+                            borderRadius: 4, cursor: 'pointer',
+                          }}
+                          title="Tắt BG box (về outline-only)"
+                        >Off</button>
+                      )}
+                    </div>
+                    <SubtitlePreview
+                      jobId={jobId}
+                      dubLangCode={dubLangCode}
+                      snapshotId={subsSnapshotId || undefined}
+                      position={subPosition}
+                      marginV={subMarginV}
+                      fontSize={subFontSize}
+                      dual={subsDual}
+                      bgColor={subBgColor}
+                      bgOpacity={subBgOpacity}
+                      apiBase={API}
+                    />
+                  </>
                 )}
               </Field>
             </div>
@@ -318,10 +549,19 @@ export default function ExportModal({
                 )}
               </Field>
               <Field label="Background audio">
-                <label className="export-modal__toggle">
-                  <input type="checkbox" checked={preserveBg} onChange={e => setPreserveBg(e.target.checked)} />
-                  Mix music/FX under the dubbed voice
-                </label>
+                <BgControls
+                  bgSource={bgSource}
+                  setBgSource={(v) => {
+                    setBgSource(v);
+                    setPreserveBg(v !== 'off');
+                  }}
+                  bgVolume={bgVolume}
+                  setBgVolume={setBgVolume}
+                  customBgInfo={customBgInfo}
+                  uploadingBg={uploadingBg}
+                  onUpload={handleBgUpload}
+                  onDelete={handleBgDelete}
+                />
               </Field>
             </div>
           )}
@@ -343,13 +583,43 @@ export default function ExportModal({
               </Field>
               <Field label="Languages">
                 <Segmented size="sm" value={subsBatch} onChange={setSubsBatch} items={[
-                  { value: 'target',   label: `Current target (${dubLangCode || '—'})` },
-                  { value: 'all-dubs', label: `All selected dubs (${selectedDubs.length})` },
+                  { value: 'target',   label: `Current (${dubLangCode || '—'})` },
+                  ...(translationSnapshots.length > 0
+                    ? [{ value: 'snapshot', label: 'Translation snapshot' }]
+                    : []),
+                  { value: 'all-dubs', label: `All (${translationSnapshots.length > 0 ? new Set(translationSnapshots.map(s => s.target_lang)).size : selectedDubs.length})` },
                 ]} />
+                {subsBatch === 'snapshot' && (
+                  <select
+                    className="input-base input-base--xs export-modal__mt6"
+                    value={subsSnapshotId}
+                    onChange={(e) => setSubsSnapshotId(e.target.value)}
+                  >
+                    <option value="">— Chọn bản dịch —</option>
+                    {translationSnapshots.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {(s.target_lang || '?').toUpperCase()} · {s.provider || '—'} · {s.quality || 'fast'}
+                        {s.genre ? ` · ${s.genre}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
               </Field>
               <div className="export-modal__note">
-                Subtitles are generated from segment text as-is — edit the segment table before exporting if you spotted typos.
+                {translationSnapshots.length > 0
+                  ? `${translationSnapshots.length} bản dịch lưu cho video này. Chọn "Translation snapshot" rồi pick ngôn ngữ cụ thể.`
+                  : 'Chưa có translation snapshot nào — sub sẽ lấy text từ segments hiện tại. Translate trước để có nhiều bản chọn.'}
               </div>
+              <SubtitlePreview
+                jobId={jobId}
+                dubLangCode={dubLangCode}
+                snapshotId={subsBatch === 'snapshot' ? subsSnapshotId : undefined}
+                position="bottom"
+                marginV={20}
+                fontSize={24}
+                dual={subsDual}
+                apiBase={API}
+              />
             </div>
           )}
 
@@ -413,14 +683,83 @@ export default function ExportModal({
   );
 }
 
-function Field({ label, hint, children }) {
+function Field({ label, hint, children, className = '' }) {
   return (
-    <div className="export-modal__field">
+    <div className={`export-modal__field ${className}`}>
       <div className="export-modal__field-head">
         <span className="export-modal__field-label">{label}</span>
         {hint && <span className="export-modal__field-hint">{hint}</span>}
       </div>
       {children}
+    </div>
+  );
+}
+
+function BgControls({
+  bgSource, setBgSource,
+  bgVolume, setBgVolume,
+  customBgInfo, uploadingBg,
+  onUpload, onDelete,
+}) {
+  return (
+    <div className="export-modal__bg">
+      <Segmented
+        size="sm"
+        value={bgSource}
+        onChange={setBgSource}
+        items={[
+          { value: 'original', label: 'Original (Demucs)', title: 'Nhạc nền tách từ video gốc' },
+          { value: 'custom', label: 'Custom file', title: 'Upload nhạc nền của bạn' },
+          { value: 'off', label: 'Off', title: 'Không trộn nhạc nền — chỉ giọng dub' },
+        ]}
+      />
+
+      {bgSource === 'custom' && (
+        <div className="export-modal__bg-custom">
+          {customBgInfo.exists ? (
+            <div className="export-modal__bg-file">
+              <span className="export-modal__bg-filename" title={customBgInfo.filename}>
+                🎵 {customBgInfo.filename}
+              </span>
+              <span className="export-modal__bg-size">
+                {Math.round((customBgInfo.size_bytes || 0) / 1024)} KB
+              </span>
+              <button type="button" className="export-modal__bg-btn" onClick={onUpload} disabled={uploadingBg}>
+                {uploadingBg ? 'Uploading…' : 'Thay file'}
+              </button>
+              <button type="button" className="export-modal__bg-btn export-modal__bg-btn--danger" onClick={onDelete}>
+                Xoá
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="export-modal__bg-upload"
+              onClick={onUpload}
+              disabled={uploadingBg}
+            >
+              {uploadingBg ? 'Đang upload…' : '⬆️ Chọn file nhạc nền (mp3/wav/m4a…)'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {bgSource !== 'off' && (
+        <div className="export-modal__bg-volume">
+          <label className="export-modal__bg-vol-label">
+            BG volume <span style={{ fontFamily: 'monospace' }}>{bgVolume}%</span>
+          </label>
+          <input
+            type="range" min="0" max="200" step="5"
+            value={bgVolume}
+            onChange={(e) => setBgVolume(Number(e.target.value))}
+            style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
+          />
+          <span className="export-modal__bg-vol-hint">
+            {bgVolume === 0 ? 'mute' : bgVolume < 50 ? 'rất nhẹ' : bgVolume <= 100 ? 'cân bằng' : 'lấn giọng'}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

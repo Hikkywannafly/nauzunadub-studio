@@ -146,6 +146,28 @@ def dub_cleanup_segments(job_id: str):
     return {"segments": cleaned, "before": len(segments), "after": len(cleaned)}
 
 
+@router.post("/dub/segments/{job_id}")
+def dub_sync_segments(job_id: str, payload: dict):
+    """Overwrite job["segments"] với phiên bản từ frontend.
+
+    Frontend gọi sau mỗi lần edit (debounced) để mọi chỗ downstream — sidebar
+    restore, timeline rebalance, translation snapshot restore, subtitle export —
+    đều thấy edits của user. Không validate sâu để giữ độ trễ thấp; field nào
+    frontend gửi thì backend lưu nguyên xi.
+
+    Body: {"segments": [...]}
+    """
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        raise HTTPException(status_code=400, detail="`segments` must be a list")
+    job["segments"] = segments
+    _save_job(job_id, job)
+    return {"ok": True, "count": len(segments)}
+
+
 @router.post("/dub/abort/{job_id}")
 def dub_abort(job_id: str):
     """Cancel in-flight upload/transcribe subprocesses for a job."""

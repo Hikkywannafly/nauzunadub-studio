@@ -42,6 +42,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
   const steps           = useAppStore(s => s.steps);
   const cfg             = useAppStore(s => s.cfg);
   const speed           = useAppStore(s => s.speed);
+  const dubSettings     = useAppStore(s => s.dubSettings);
   const translateQuality = useAppStore(s => s.translateQuality);
   const glossaryTerms   = useAppStore(s => s.glossaryTerms);
 
@@ -286,6 +287,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
     setIsTranslating(true);
     try {
       const data = await dubTranslate({
+        job_id: dubJobId || undefined,
         segments: dubSegments.map(s => ({
           id: String(s.id),
           text: (s.text_original && s.text_original.trim()) ? s.text_original : s.text,
@@ -321,7 +323,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
       }
     } catch (err) { setDubError('Translation failed: ' + err.message); }
     setIsTranslating(false);
-  }, [dubSegments, dubLangCode, translateProvider, translateQuality, glossaryTerms, setIsTranslating, setDubSegments, setDubError]);
+  }, [dubJobId, dubSegments, dubLangCode, translateProvider, translateQuality, translateGenre, glossaryTerms, setIsTranslating, setDubSegments, setDubError]);
 
   const handleDubGenerate = useCallback(async (opts = {}) => {
     const regenOnly = Array.isArray(opts.regenOnly) && opts.regenOnly.length ? opts.regenOnly : null;
@@ -351,6 +353,16 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
         num_step: steps, guidance_scale: cfg, speed,
         preview,
         audio_profile: audioProfile,
+        // Mix-time tuning (DubSettingsModal). Sent every time so backend
+        // doesn't fall back to module defaults silently if user changed them.
+        slot_fit: dubSettings.slotFit,
+        fill_slot_mode: dubSettings.fillSlotMode,
+        tts_pacing: dubSettings.ttsPacing,
+        start_fade_ms: dubSettings.startFadeMs,
+        end_fade_ms: dubSettings.endFadeMs,
+        tail_allowance_s: dubSettings.tailAllowanceS,
+        slot_factor_min: dubSettings.slotFactorMin,
+        slot_factor_max: dubSettings.slotFactorMax,
       };
       const data = await dubGenerate(dubJobId, body);
       setDubTaskId(data.task_id);
@@ -405,7 +417,7 @@ export default function useDubWorkflow({ loadProjects, loadProfiles, loadDubHist
       setDubError(err.message); setDubStep('editing'); setDubTaskId(null);
       useAppStore.getState().errorPill(err.message);
     }
-  }, [dubJobId, dubSegments, dubLang, dubLangCode, dubInstruct, steps, cfg, speed, dubStep, setDubStep, setDubProgress, setDubError, setDubTracks, setDubSegments, setDubTaskId, setPreviewSegIds, setLastGenFingerprints, loadDubHistory, loadProjects]);
+  }, [dubJobId, dubSegments, dubLang, dubLangCode, dubInstruct, steps, cfg, speed, dubSettings, audioProfile, dubStep, setDubStep, setDubProgress, setDubError, setDubTracks, setDubSegments, setDubTaskId, setPreviewSegIds, setLastGenFingerprints, loadDubHistory, loadProjects]);
 
   const handleDubStop = useCallback(async () => {
     if (!dubTaskId) return;
