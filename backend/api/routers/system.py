@@ -4,8 +4,9 @@ import uuid
 import psutil
 import asyncio
 import logging
-from fastapi import APIRouter, File, UploadFile, HTTPException, Query
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Query
 from api.schemas import SysinfoResponse, SystemInfoResponse, ModelStatusResponse, LogsResponse, FlushMemoryResponse
+from api.dependencies import require_loopback
 from fastapi.responses import FileResponse, StreamingResponse
 import torch
 import shutil
@@ -14,7 +15,10 @@ from core.config import OUTPUTS_DIR, DATA_DIR, CRASH_LOG_PATH, LOG_PATH, IDLE_TI
 from services.model_manager import get_model_status, get_best_device
 from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
 
-router = APIRouter()
+# Router-level loopback gate — every /system/* route on this router 403s any
+# request whose client.host is not a loopback address. Closes the LAN gap on
+# /system/set-env, /system/flush-memory, /system/logs/*, /clean-audio, etc.
+router = APIRouter(dependencies=[Depends(require_loopback)])
 logger = logging.getLogger("omnivoice.api")
 
 # Cache device checks at module load — they don't change at runtime
@@ -613,3 +617,13 @@ async def _do_clean_audio(audio, tmp_dir, clean_id):
 
     return FileResponse(final_path, media_type="audio/wav", filename=clean_filename,
                         headers={"X-Clean-Filename": clean_filename})
+
+
+@router.get("/system/asr-backends")
+def asr_backends():
+    """List all registered ASR backends and their availability."""
+    from services.asr_backend import list_backends, active_backend_id
+    return {
+        "active": active_backend_id(),
+        "backends": list_backends(),
+    }

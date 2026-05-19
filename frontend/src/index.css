@@ -2302,7 +2302,7 @@ div[role="dialog"].audio-trimmer {
 
 /* ── Segment table — tighter columns ── */
 @media (max-width: 800px) {
-  .segment-time { width: 45px !important; font-size: 0.58rem !important; }
+  .segment-time { width: 85px !important; font-size: 0.55rem !important; }
   .segment-row { padding: 2px 4px; }
   .segment-header { padding: 2px 4px; font-size: 0.58rem; }
 }

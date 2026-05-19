@@ -2,9 +2,27 @@
 .seg-check {
   width: 16px; flex-shrink: 0; margin-right: 2px; cursor: pointer;
 }
+/* Time cell holds `start – end` (e.g. "0:07.2 – 0:12.7"). Match column
+   width (100px) so the dash + end time can't bleed into the Spkr cell. */
 .seg-time {
-  width: 50px; flex-shrink: 0; display: flex; flex-direction: column;
+  width: 100px; flex-shrink: 0; display: flex; flex-direction: column;
+  overflow: hidden;
 }
+.seg-time-row {
+  display: inline-flex; align-items: center; gap: 2px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.seg-time-input {
+  width: 42px; padding: 0 2px; font-size: 0.58rem;
+  background: transparent; border: 1px solid transparent; border-radius: 2px;
+  color: inherit; text-align: right; font-variant-numeric: tabular-nums;
+  cursor: text;
+}
+.seg-time-input:hover:not(:disabled) { border-color: rgba(168, 153, 132, 0.25); }
+.seg-time-input:focus { outline: none; border-color: rgba(211, 134, 155, 0.6); background: rgba(0,0,0,0.2); }
+.seg-time-sep { opacity: 0.5; padding: 0 1px; }
+.seg-time-end { opacity: 0.8; font-size: 0.58rem; }
 .seg-sync-badge {
   font-size: 0.5rem; margin-top: 2px;
   display: inline-flex; align-items: center; gap: 2px;
@@ -16,10 +34,36 @@
 .seg-speed-badge {
   font-size: 0.55rem; margin-left: 2px;
 }
+/* Compact speaker chip — fits "Speaker 1" without truncation, restrained
+   visual weight so it doesn't fight the Text column for attention. */
 .seg-speaker-input {
-  width: 45px; flex-shrink: 0; font-size: 0.55rem; color: #a89984;
-  padding: 1px 2px; text-align: center;
+  width: 70px;
+  flex-shrink: 0;
+  font-size: 0.6rem;
+  color: var(--chrome-fg-muted);
+  padding: 2px 6px;
+  text-align: left;
+  background: color-mix(in srgb, var(--chrome-hover-bg) 60%, transparent);
+  border: 1px solid var(--chrome-border);
+  border-radius: 4px;
+  height: 22px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
 }
+.seg-speaker-input:hover:not(:disabled) {
+  background: var(--chrome-hover-bg);
+  color: var(--chrome-fg);
+  border-color: var(--chrome-border-strong);
+}
+.seg-speaker-input:focus {
+  background: var(--chrome-bg);
+  color: var(--chrome-fg);
+  border-color: var(--chrome-border-strong);
+  outline: none;
+}
+.seg-speaker-input::placeholder { color: var(--chrome-fg-dim); font-style: italic; }
 .seg-text-col {
   flex: 1 1 0%; display: flex; flex-direction: column; gap: 2px;
   min-width: 80px; overflow: hidden;

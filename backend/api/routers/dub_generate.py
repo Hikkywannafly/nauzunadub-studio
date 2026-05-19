@@ -240,18 +240,50 @@ async def dub_generate(job_id: str, req: DubRequest):
                     )
                     return normalize_audio(mastered_audio, profile=_ap)
                 except Exception as e:
+                    is_oom = (
+                        isinstance(e, torch.cuda.OutOfMemoryError)
+                        or "out of memory" in str(e).lower()
+                        or "CUDA error" in str(e)
+                    )
                     import gc
                     gc.collect()
-                    if torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
-                    elif torch.cuda.is_available():
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    # User-facing: what happened · why · what to do.
-                    raise RuntimeError(
-                        f"Ran out of GPU memory generating this segment. "
-                        f"Try the Flush button in the header to free VRAM, or switch to CPU in Settings. "
-                        f"Underlying error: {e}"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+
+                    if not is_oom:
+                        raise  # Non-OOM — propagate real error, don't mask it.
+
+                    retry_steps = min(nstep, 8)
+                    logger.warning(
+                        "OOM on segment (nstep=%d), retrying with %d steps after cache flush",
+                        nstep, retry_steps,
                     )
+                    try:
+                        audios = _model.generate(
+                            text=text, language=lang if lang != "Auto" else None,
+                            ref_audio=ref_audio, ref_text=ref_text,
+                            instruct=instruct_str if instruct_str else None,
+                            num_step=retry_steps, guidance_scale=cfg,
+                            speed=spd, denoise=True, postprocess_output=True,
+                        )
+                        audio_out = audios[0]
+                        _ap = getattr(req, "audio_profile", None) or "broadcast"
+                        mastered_audio = apply_mastering(
+                            audio_out,
+                            sample_rate=_model.sampling_rate if hasattr(_model, 'sampling_rate') else 24000,
+                            profile=_ap,
+                        )
+                        return normalize_audio(mastered_audio, profile=_ap)
+                    except Exception as retry_err:
+                        raise RuntimeError(
+                            f"Ran out of GPU memory generating this segment. "
+                            f"Retried with {retry_steps} steps but still failed. "
+                            f"Try the Flush button in the header to free VRAM, "
+                            f"or switch to CPU in Settings. "
+                            f"Underlying error: {retry_err}"
+                        )
 
             seg_instruct = seg.instruct or req.instruct
             seg_profile = seg.profile_id or None

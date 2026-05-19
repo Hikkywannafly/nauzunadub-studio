@@ -312,4 +312,8 @@ else:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3900)
+    # SECURITY: default to loopback. No auth on the API; binding to 0.0.0.0
+    # by default would expose every router to any host on the user's LAN.
+    # Docker images publish via host-side port mapping with OMNIVOICE_BIND_HOST=0.0.0.0.
+    _bind_host = os.environ.get("OMNIVOICE_BIND_HOST", "127.0.0.1")
+    uvicorn.run(app, host=_bind_host, port=3900)

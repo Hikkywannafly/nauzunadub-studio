@@ -58,6 +58,64 @@ models:
     size_gb: 0.08
     platforms: [darwin-arm64]
 
+  - repo_id: "Systran/faster-whisper-large-v3-turbo"
+    label: "Whisper large-v3 Turbo (5× faster, 0.8B)"
+    role: ASR
+    size_gb: 1.6
+    note: "Best speed/quality tradeoff. 5× faster than large-v3 with minimal WER loss."
+
+  - repo_id: "Systran/faster-distil-whisper-large-v3"
+    label: "Distil-Whisper large-v3 (distilled, fast)"
+    role: ASR
+    size_gb: 1.5
+    note: "Knowledge-distilled from large-v3. Good accuracy at higher speed."
+
+  - repo_id: "Systran/faster-whisper-medium"
+    label: "Whisper medium (balanced, lower VRAM)"
+    role: ASR
+    size_gb: 1.5
+    note: "Good balance of speed and accuracy. Half the VRAM of large-v3."
+
+  - repo_id: "Systran/faster-whisper-small"
+    label: "Whisper small (fast preview, low VRAM)"
+    role: ASR
+    size_gb: 0.5
+    note: "Quick previews and testing. ~2× faster than medium."
+
+  - repo_id: "Systran/faster-whisper-base"
+    label: "Whisper base (minimal, fastest Whisper)"
+    role: ASR
+    size_gb: 0.15
+    note: "Lowest accuracy but near-instant. Good for rapid iteration."
+
+  # ── Non-Whisper ASR (from Open ASR Leaderboard) ────────────────────────
+
+  - repo_id: "nvidia/parakeet-tdt-0.6b-v3"
+    label: "Parakeet TDT 0.6B v3 (NVIDIA — SOTA, 25+ langs)"
+    role: ASR
+    size_gb: 1.2
+    platforms: [cuda]
+    note: "Beats Whisper large-v3 on English benchmarks. Requires nemo_toolkit[asr]."
+
+  - repo_id: "nvidia/parakeet-tdt-0.6b-v2"
+    label: "Parakeet TDT 0.6B v2 (NVIDIA — English + punctuation)"
+    role: ASR
+    size_gb: 1.2
+    platforms: [cuda]
+    note: "English-optimized with punctuation/capitalization. Requires nemo_toolkit[asr]."
+
+  - repo_id: "UsefulSensors/moonshine-base"
+    label: "Moonshine base (edge-optimized, 61M, ONNX)"
+    role: ASR
+    size_gb: 0.12
+    note: "Variable-length processing, sub-200ms latency. Great for CPU/edge. Requires moonshine-onnx."
+
+  - repo_id: "UsefulSensors/moonshine-small"
+    label: "Moonshine small (edge-optimized, 300M, ONNX)"
+    role: ASR
+    size_gb: 0.6
+    note: "Higher accuracy than base, still fast. Requires moonshine-onnx."
+
   # ── Diarisation ───────────────────────────────────────────────────────
 
   - repo_id: "pyannote/speaker-diarization-3.1"

@@ -497,6 +497,165 @@ class PyTorchWhisperBackend(ASRBackend):
         return result if isinstance(result, dict) else {"chunks": [], "raw": result}
 
 
+# ── NeMo Parakeet TDT (NVIDIA — English SOTA from ASR Leaderboard) ─────────
+
+
+class NeMoASRBackend(ASRBackend):
+    """NVIDIA Parakeet TDT via NeMo toolkit. Requires CUDA + nemo_toolkit[asr]."""
+    id = "nemo-parakeet"
+    display_name = "Parakeet TDT (NVIDIA NeMo — English SOTA)"
+
+    def __init__(self):
+        self._model_name = os.environ.get(
+            "ASR_MODEL_NEMO", "nvidia/parakeet-tdt-0.6b-v3"
+        )
+        self._model = None
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False, "Parakeet TDT requires NVIDIA GPU (CUDA)"
+        except ImportError:
+            return False, "PyTorch not installed"
+        try:
+            import nemo.collections.asr  # noqa: F401
+            return True, "ready"
+        except ImportError as e:
+            return False, f"nemo_toolkit[asr] not installed: {e}"
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        import nemo.collections.asr as nemo_asr
+        logger.info("NeMo loading %s", self._model_name)
+        self._model = nemo_asr.models.ASRModel.from_pretrained(
+            model_name=self._model_name
+        )
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+        self._ensure_model()
+        logger.info(
+            "NeMo Parakeet transcribing %s (word_timestamps=%s)",
+            audio_path, word_timestamps,
+        )
+        outputs = self._model.transcribe([audio_path], timestamps=word_timestamps)
+        hyp = outputs[0] if outputs else None
+        if hyp is None:
+            return {"chunks": [], "segments": [], "language": "en"}
+
+        text = hyp.text if hasattr(hyp, "text") else str(hyp)
+        words = []
+        segments_out = []
+        if word_timestamps and hasattr(hyp, "timestep") and hyp.timestep:
+            try:
+                ts = hyp.timestep
+                if isinstance(ts, dict) and "word" in ts:
+                    for w in ts["word"]:
+                        words.append({
+                            "word": w.get("char", w.get("word", "")),
+                            "start": w.get("start_offset", 0),
+                            "end": w.get("end_offset", 0),
+                        })
+            except Exception as e:
+                logger.debug("NeMo timestamp extraction: %s", e)
+
+        if text.strip():
+            segments_out.append({
+                "text": text,
+                "start": words[0]["start"] if words else 0.0,
+                "end": words[-1]["end"] if words else None,
+                "words": words,
+            })
+
+        chunks = [
+            {"text": seg["text"], "timestamp": (seg["start"], seg["end"])}
+            for seg in segments_out
+        ]
+        return {"chunks": chunks, "segments": segments_out, "language": "en"}
+
+    def unload(self) -> None:
+        self._model = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+# ── Moonshine (edge-optimized, variable-length — from ASR Leaderboard) ─────
+
+
+class MoonshineASRBackend(ASRBackend):
+    """Moonshine ASR via moonshine-onnx or moonshine-voice."""
+    id = "moonshine"
+    display_name = "Moonshine (edge-optimized, ONNX)"
+
+    def __init__(self):
+        self._model_name = os.environ.get(
+            "ASR_MODEL_MOONSHINE", "moonshine/base"
+        )
+        self._transcriber = None
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import moonshine_onnx  # noqa: F401
+            return True, "ready (moonshine_onnx)"
+        except ImportError:
+            pass
+        try:
+            from moonshine_voice import Transcriber  # noqa: F401
+            return True, "ready (moonshine_voice)"
+        except ImportError:
+            pass
+        return False, (
+            "moonshine not installed. Install with: "
+            "uv pip install moonshine-onnx  (or moonshine-voice)"
+        )
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+        logger.info("Moonshine transcribing %s (model=%s)", audio_path, self._model_name)
+        try:
+            import moonshine_onnx
+            text = moonshine_onnx.transcribe(audio_path, model=self._model_name)
+            if isinstance(text, list):
+                text = " ".join(text)
+        except ImportError:
+            from moonshine_voice import Transcriber
+            if self._transcriber is None:
+                self._transcriber = Transcriber(model=self._model_name)
+            text = self._transcriber.transcribe_file(audio_path)
+            if isinstance(text, list):
+                text = " ".join(text)
+
+        segments_out = []
+        if text and text.strip():
+            try:
+                import soundfile as sf
+                duration = sf.info(audio_path).duration
+            except Exception:
+                duration = None
+            segments_out.append({
+                "text": text.strip(),
+                "start": 0.0,
+                "end": duration,
+                "words": [],
+            })
+        chunks = [
+            {"text": seg["text"], "timestamp": (seg["start"], seg["end"])}
+            for seg in segments_out
+        ]
+        return {"chunks": chunks, "segments": segments_out, "language": "en"}
+
+    def unload(self) -> None:
+        self._transcriber = None
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 
@@ -505,6 +664,8 @@ _REGISTRY: dict[str, type[ASRBackend]] = {
     "faster-whisper":  FasterWhisperBackend,
     "mlx-whisper":     MLXWhisperBackend,
     "pytorch-whisper": PyTorchWhisperBackend,
+    "nemo-parakeet":   NeMoASRBackend,
+    "moonshine":       MoonshineASRBackend,
 }
 
 
