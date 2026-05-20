@@ -2,7 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { X, RotateCcw, SlidersHorizontal } from 'lucide-react';
 import { useAppStore } from '../store';
-import { DUB_SETTINGS_DEFAULTS } from '../store/dubSettingsSlice';
+import { DUB_SETTINGS_DEFAULTS, DUB_PRESETS, matchPreset } from '../store/dubSettingsSlice';
 import { Button, Segmented, Badge } from '../ui';
 import './DubSettingsModal.css';
 
@@ -56,6 +56,16 @@ export default function DubSettingsModal({ open, onClose }) {
     setCfg(2.0);
   };
 
+  const currentPresetId = matchPreset(dubSettings, speed, steps, cfg);
+  const applyPreset = (presetId) => {
+    const preset = DUB_PRESETS.find((p) => p.id === presetId);
+    if (!preset) return;
+    setDubSettings(preset.settings);
+    setSpeed(preset.speed);
+    setSteps(preset.steps);
+    setCfg(preset.cfg);
+  };
+
   return createPortal(
     <div className="dub-settings-drawer">
       <div ref={drawerRef} className="dub-settings-drawer__sheet">
@@ -79,6 +89,31 @@ export default function DubSettingsModal({ open, onClose }) {
           <button className="dub-settings-drawer__close" onClick={onClose} title="Close (Esc)">
             <X size={14} />
           </button>
+        </div>
+
+        {/* ─── Preset selector — quick-switch giữa lip-sync / fast-pace ── */}
+        <div className="dub-settings-presets">
+          <div className="dub-settings-presets__label">Preset</div>
+          <div className="dub-settings-presets__list">
+            {DUB_PRESETS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className={`dub-settings-preset ${currentPresetId === p.id ? 'is-active' : ''}`}
+                onClick={() => applyPreset(p.id)}
+                title={p.description}
+              >
+                <span className="dub-settings-preset__name">{p.name}</span>
+                <span className="dub-settings-preset__desc">{p.description}</span>
+              </button>
+            ))}
+            {currentPresetId === null && (
+              <div className="dub-settings-preset is-custom" title="Bạn đã chỉnh tay — không khớp preset nào">
+                <span className="dub-settings-preset__name">Custom</span>
+                <span className="dub-settings-preset__desc">Giá trị hiện tại đã chỉnh tay.</span>
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="dub-settings-drawer__body">

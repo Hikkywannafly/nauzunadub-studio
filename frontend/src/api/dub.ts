@@ -188,6 +188,59 @@ export async function deleteTimelineSnapshot(jobId: string, snapId: string): Pro
   return apiFetch(`/dub/timeline/snapshots/${jobId}/${snapId}`, { method: 'DELETE' });
 }
 
+// ── Auto-fix sync (rebalance + LLM optimize batch) ──────────────────────
+export interface OptimizeBatchResult {
+  id: string;
+  idx?: number;
+  old_text?: string;
+  new_text?: string;
+  old_ratio: number;
+  new_ratio?: number;
+  old_severity?: string;
+  new_severity?: string;
+  changed?: boolean;
+  skipped?: string;
+  error?: string;
+}
+
+export interface OptimizeBatchResponse {
+  fixed: number;
+  unchanged: number;
+  failed: number;
+  results: OptimizeBatchResult[];
+  message?: string;
+}
+
+export interface AutoFixResponse {
+  rebalance: {
+    snapshot_id: string;
+    stats: RebalanceStats;
+    before: CPSSummary;
+    after: CPSSummary;
+  } | null;
+  optimize: OptimizeBatchResponse | null;
+  segments: unknown[];
+}
+
+export interface AutoFixOptions {
+  rebalance?: boolean;
+  max_drift_s?: number;
+  severities?: string[];
+  genre_id?: string | null;
+  concurrency?: number;
+}
+
+export async function autoFixJob(jobId: string, opts: AutoFixOptions = {}): Promise<AutoFixResponse> {
+  return apiPost(`/dub/auto-fix/${jobId}`, opts);
+}
+
+export async function optimizeBatch(
+  jobId: string,
+  opts: { seg_ids?: string[]; severities?: string[]; genre_id?: string | null; concurrency?: number } = {},
+): Promise<OptimizeBatchResponse> {
+  return apiPost(`/dub/segment/optimize-batch/${jobId}`, opts);
+}
+
 // ── Custom background audio ──────────────────────────────────────────────
 export interface CustomBgInfo {
   exists: boolean;

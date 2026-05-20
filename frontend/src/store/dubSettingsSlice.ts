@@ -49,6 +49,70 @@ export const DUB_SETTINGS_DEFAULTS: DubSettings = {
   ttsPacing: 'fit_slot',
 };
 
+/**
+ * Preset — combo của DubSettings + TTS global knobs (speed/steps/cfg sống ở
+ * generateSlice). Áp preset = ghi đè cả 2 slice cùng lúc qua DubSettingsModal.
+ *
+ * Khi user chỉnh tay sau đó, current state sẽ không khớp preset nào →
+ * modal hiển thị "Custom".
+ */
+export interface DubPreset {
+  id: string;
+  name: string;
+  description: string;
+  settings: DubSettings;
+  speed: number;
+  steps: number;
+  cfg: number;
+}
+
+export const DUB_PRESETS: DubPreset[] = [
+  {
+    id: 'default',
+    name: 'Default · Lip-sync',
+    description: 'Cân bằng. Ưu tiên giữ lip-sync với video gốc.',
+    settings: { ...DUB_SETTINGS_DEFAULTS },
+    speed: 1.0,
+    steps: 16,
+    cfg: 2.0,
+  },
+  {
+    id: 'fast-news',
+    name: 'Fast Pace · News / Edu',
+    description: 'Câu liền câu, không lấy hơi. TikTok news, kiến thức, voiceover nhanh.',
+    settings: {
+      ttsPacing: 'fit_slot',
+      slotFit: 'time_stretch',
+      fillSlotMode: 'anchor_end',  // dồn silence về đầu seg → cuối seg N "kissing" đầu seg N+1
+      tailAllowanceS: 0.05,         // cắt hơi thở
+      slotFactorMin: 0.85,
+      slotFactorMax: 1.40,          // cho phép speed-up mạnh khi text dài
+      startFadeMs: 5,               // vào câu dứt khoát
+      endFadeMs: 15,                // cắt cuối gọn
+    },
+    speed: 1.08,                    // giọng đọc nhanh ~8%
+    steps: 16,
+    cfg: 2.0,
+  },
+];
+
+/** Find preset id matching current state, hoặc null nếu Custom. */
+export function matchPreset(
+  settings: DubSettings,
+  speed: number,
+  steps: number,
+  cfg: number,
+): string | null {
+  const keys = Object.keys(DUB_SETTINGS_DEFAULTS) as (keyof DubSettings)[];
+  for (const p of DUB_PRESETS) {
+    const settingsMatch = keys.every((k) => settings[k] === p.settings[k]);
+    if (settingsMatch && speed === p.speed && steps === p.steps && cfg === p.cfg) {
+      return p.id;
+    }
+  }
+  return null;
+}
+
 export interface DubSettingsSlice {
   dubSettings: DubSettings;
   setDubSettings: (patch: Partial<DubSettings>) => void;

@@ -254,3 +254,29 @@
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* Auto-fix: visual hierarchy phân biệt với Apply rebalance — outline thay vì
+   solid + accent vàng để gợi ý "action mạnh hơn, có call LLM". */
+.timeline-rebalance-bar__autofix {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  background: rgba(250, 189, 47, 0.12);
+  color: #fabd2f;
+  border: 1px solid rgba(250, 189, 47, 0.5);
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+}
+.timeline-rebalance-bar__autofix:hover:not(:disabled) {
+  background: #fabd2f;
+  border-color: #fabd2f;
+  color: #1d2021;
+}
+.timeline-rebalance-bar__autofix:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}

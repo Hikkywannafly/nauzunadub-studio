@@ -827,6 +827,13 @@ audio::-webkit-media-controls-time-remaining-display { color: var(--chrome-fg); 
   box-sizing: border-box;
   border-bottom: 1px solid rgba(255,255,255,0.02);
   transition: background var(--transition-fast);
+  /* Critical: react-window positions rows absolutely. If actual content
+     exceeds the rowHeight() value, the overflow visually leaks down into
+     the next row. DubSegmentTable.jsx computes rowHeight from badge count
+     to size correctly; this overflow:hidden is the last-line defense.
+     .seg-time uses align-self:stretch to fill the row height so badges
+     stack from the top instead of being clipped by center-alignment. */
+  overflow: hidden;
 }
 .segment-row:hover { background: var(--chrome-hover-bg); }
 .segment-row.segment-active {

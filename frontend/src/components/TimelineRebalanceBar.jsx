@@ -1,14 +1,16 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Sparkles, Zap, Undo2, ChevronDown, Loader } from 'lucide-react';
+import { Sparkles, Zap, Undo2, ChevronDown, Loader, Wand2 } from 'lucide-react';
 import {
   rebalanceTimeline,
   listTimelineSnapshots,
   restoreTimelineSnapshot,
   deleteTimelineSnapshot,
+  autoFixJob,
 } from '../api/dub';
 import { useAppStore } from '../store';
 import { Segmented } from '../ui';
+import { rateRatio as computeRateRatio, severityTier } from '../api/segmentRate';
 import toast from 'react-hot-toast';
 import './TranslationHistoryPicker.css';
 
@@ -29,8 +31,10 @@ export default function TimelineRebalanceBar() {
   const dubSegments = useAppStore((s) => s.dubSegments);
   const setDubSegments = useAppStore((s) => s.setDubSegments);
 
+  const dubLangCode = useAppStore((s) => s.dubLangCode);
   const [mode, setMode] = useState('even');
   const [running, setRunning] = useState(false);
+  const [autoFixing, setAutoFixing] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [snapshots, setSnapshots] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -41,7 +45,25 @@ export default function TimelineRebalanceBar() {
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
 
   const hasTranslated = dubSegments.some((s) => s.text_original && s.text_original !== s.text);
-  const disabled = !dubJobId || !dubSegments.length || running || !hasTranslated;
+  const disabled = !dubJobId || !dubSegments.length || running || autoFixing || !hasTranslated;
+
+  // Count out-of-range segs — mirror DubSegmentRow live-severity logic so the
+  // button label matches the badges user sees on each row.
+  const outOfRangeCount = useMemo(() => {
+    if (!hasTranslated) return 0;
+    const lang = (dubLangCode || 'vi').toLowerCase();
+    let n = 0;
+    for (const s of dubSegments) {
+      const text = (s.text || '').trim();
+      const slot = Math.max(0, (s.end ?? 0) - (s.start ?? 0));
+      if (!text || slot <= 0) continue;
+      const isTranslated = !!s.text_original && s.text !== s.text_original;
+      if (!isTranslated) continue;
+      const tier = severityTier(computeRateRatio(s.text || '', slot, lang));
+      if (tier !== 'ok') n++;
+    }
+    return n;
+  }, [dubSegments, dubLangCode, hasTranslated]);
 
   const refresh = useCallback(async () => {
     if (!dubJobId) { setSnapshots([]); return; }
@@ -96,6 +118,41 @@ export default function TimelineRebalanceBar() {
       window.removeEventListener('resize', measure);
     };
   }, [historyOpen]);
+
+  const handleAutoFix = async () => {
+    if (!dubJobId || outOfRangeCount === 0) return;
+    setAutoFixing(true);
+    const toastId = toast.loading(
+      `Auto-fix ${outOfRangeCount} seg: rebalance + LLM optimize…`,
+    );
+    try {
+      const res = await autoFixJob(dubJobId, { rebalance: true });
+      // Backend trả `segments` đã apply cả rebalance (timing) + optimize (text).
+      // Normalize id giống các hàm khác để store hoạt động đúng.
+      if (Array.isArray(res.segments)) {
+        const segs = res.segments.map((s, i) => ({
+          ...s,
+          id: s.id != null ? String(s.id) : String(i),
+        }));
+        setDubSegments(segs);
+      }
+
+      const reb = res.rebalance;
+      const opt = res.optimize;
+      const rebSummary = reb
+        ? `rebalanced ${reb.stats?.shifted ?? 0} seg (CPS ${reb.before?.max_cps}→${reb.after?.max_cps})`
+        : 'skip rebalance';
+      const optSummary = `optimized ${opt?.fixed ?? 0} text${opt?.failed ? `, ${opt.failed} fail` : ''}${opt?.unchanged ? `, ${opt.unchanged} chưa đổi` : ''}`;
+      toast.success(
+        `✓ Auto-fix xong · ${rebSummary} · ${optSummary}. Bấm Generate để regen TTS.`,
+        { id: toastId, duration: 8000 },
+      );
+    } catch (err) {
+      toast.error(`Auto-fix thất bại: ${err.message || err}`, { id: toastId });
+    } finally {
+      setAutoFixing(false);
+    }
+  };
 
   const handleApply = async () => {
     if (!dubJobId) return;
@@ -184,6 +241,26 @@ export default function TimelineRebalanceBar() {
       >
         {running ? <Loader size={11} className="spinner" /> : <Zap size={11} />}
         <span>Apply</span>
+      </button>
+
+      {/* Auto-fix: Rebalance Even + LLM optimize cho mọi seg out-of-range */}
+      <button
+        type="button"
+        className="timeline-rebalance-bar__autofix"
+        onClick={handleAutoFix}
+        disabled={disabled || outOfRangeCount === 0}
+        title={
+          !hasTranslated
+            ? 'Translate trước khi auto-fix'
+            : outOfRangeCount === 0
+              ? 'Mọi segment đã trong khoảng 85–115% — không cần auto-fix'
+              : `Auto-fix ${outOfRangeCount} seg out-of-range: rebalance Even + LLM optimize text. Sau đó cần bấm Generate để regen TTS.`
+        }
+      >
+        {autoFixing ? <Loader size={11} className="spinner" /> : <Wand2 size={11} />}
+        <span>
+          Auto-fix{outOfRangeCount > 0 ? ` (${outOfRangeCount})` : ''}
+        </span>
       </button>
 
       <div className="tr-history-picker" ref={historyRef}>

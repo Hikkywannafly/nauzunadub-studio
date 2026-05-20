@@ -266,6 +266,228 @@ async def optimize_segment(payload: dict):
     return await shorten_segment(payload)
 
 
+@router.post("/dub/segment/optimize-batch/{job_id}")
+async def optimize_batch(job_id: str, payload: dict):
+    """Batch-optimize mọi seg out-of-range trong 1 job.
+
+    Body:
+      {
+        "severities": ["critical", "warn", "short"],  // tier nào sẽ chạy. Default = non-ok.
+        "seg_ids": ["id1", "id2"],                    // override: chỉ chạy đúng list này
+        "genre_id": "cdrama_business",                // optional, giữ tone
+        "concurrency": 3,                             // cap LLM song song (env override available)
+      }
+
+    Strategy:
+      1. Filter segs theo `seg_ids` (nếu có) hoặc severity tier.
+      2. Chạy `adjust_for_slot` song song với semaphore (default 3 — LLM-friendly).
+      3. Mutate seg.text + seg.rate_ratio + seg.rate_severity trong job_data.
+      4. Trả về stats { fixed, unchanged, failed, before/after distribution }.
+
+    Lưu ý: KHÔNG regen TTS. Sau khi gọi xong, frontend cần bấm Generate (hoặc
+    selective regen) để TTS đọc text mới. Endpoint này chỉ động `segments[].text`.
+    """
+    from services.speech_rate import (
+        adjust_for_slot, rate_ratio as compute_ratio, severity_tier,
+    )
+
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    segs = job.get("segments") or []
+    if not segs:
+        return {"fixed": 0, "unchanged": 0, "failed": 0, "results": []}
+
+    target_lang = (job.get("language_code") or "vi").lower()
+    genre_id = payload.get("genre_id") or job.get("genre_id")
+    requested_ids = set(payload.get("seg_ids") or [])
+    target_severities = set(payload.get("severities") or ["critical", "warn", "short"])
+    concurrency = max(1, int(payload.get("concurrency") or 3))
+
+    # Pick targets — explicit seg_ids beats severity filter
+    def _seg_severity(s: dict) -> str:
+        text = (s.get("text") or "").strip()
+        slot = max(0.0, float(s.get("end") or 0) - float(s.get("start") or 0))
+        if not text or slot <= 0:
+            return "ok"
+        return severity_tier(compute_ratio(text, slot, target_lang))
+
+    targets = []
+    for i, s in enumerate(segs):
+        sid = str(s.get("id", i))
+        if requested_ids:
+            if sid in requested_ids:
+                targets.append((i, s))
+        else:
+            if _seg_severity(s) in target_severities:
+                targets.append((i, s))
+
+    if not targets:
+        return {"fixed": 0, "unchanged": 0, "failed": 0, "results": [],
+                "message": "Không có seg nào cần optimize"}
+
+    sem = asyncio.Semaphore(concurrency)
+    loop = asyncio.get_running_loop()
+
+    async def _run_one(idx: int, seg: dict) -> dict:
+        text = (seg.get("text") or "").strip()
+        source_text = (seg.get("text_original") or "").strip() or None
+        slot = max(0.0, float(seg.get("end") or 0) - float(seg.get("start") or 0))
+        old_ratio = compute_ratio(text, slot, target_lang) if (text and slot > 0) else 1.0
+
+        if not text or slot <= 0:
+            return {"id": str(seg.get("id", idx)), "skipped": "empty", "old_ratio": old_ratio}
+
+        async with sem:
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: adjust_for_slot(
+                        text,
+                        slot_seconds=slot,
+                        target_lang=target_lang,
+                        source_text=source_text,
+                        genre_id=genre_id,
+                    ),
+                )
+            except Exception as e:
+                logger.warning("optimize-batch seg %s failed: %s", seg.get("id"), e)
+                return {"id": str(seg.get("id", idx)), "error": str(e), "old_ratio": old_ratio}
+
+        new_text = result.get("text", text)
+        new_ratio = result.get("rate_ratio", old_ratio)
+        changed = new_text != text
+        return {
+            "id": str(seg.get("id", idx)),
+            "idx": idx,
+            "old_text": text,
+            "new_text": new_text,
+            "old_ratio": round(old_ratio, 3),
+            "new_ratio": round(new_ratio, 3),
+            "old_severity": severity_tier(old_ratio),
+            "new_severity": severity_tier(new_ratio),
+            "changed": changed,
+            "attempts": result.get("attempts", 0),
+            "error": result.get("error"),
+        }
+
+    results = await asyncio.gather(*(_run_one(i, s) for i, s in targets))
+
+    # Mutate job in place — only on actual change. Skip ones that failed or
+    # returned same text (LLM gave up / no-llm / equal output).
+    fixed = 0
+    for r in results:
+        if r.get("changed"):
+            idx = r.get("idx")
+            if idx is not None and 0 <= idx < len(segs):
+                segs[idx]["text"] = r["new_text"]
+                segs[idx]["rate_ratio"] = r["new_ratio"]
+                fixed += 1
+
+    if fixed > 0:
+        job["segments"] = segs
+        _save_job(job_id, job)
+
+    unchanged = sum(1 for r in results if not r.get("changed") and not r.get("error"))
+    failed = sum(1 for r in results if r.get("error"))
+
+    return {
+        "fixed": fixed,
+        "unchanged": unchanged,
+        "failed": failed,
+        "results": results,
+    }
+
+
+@router.post("/dub/auto-fix/{job_id}")
+async def auto_fix_job(job_id: str, payload: dict):
+    """Combo 1-click: Rebalance Even → Optimize batch các seg còn out-of-range.
+
+    Body:
+      {
+        "rebalance": true,           // skip step 1 nếu false (text-only fix)
+        "max_drift_s": 1.5,
+        "severities": ["critical", "warn", "short"],
+        "genre_id": "...",
+        "concurrency": 3,
+      }
+
+    Trả về stats gộp cả 2 step để UI hiển thị "Rebalanced N runs, optimized M segs".
+    """
+    from services.timeline_rebalance import rebalance_even, cps_summary
+    from services.speech_rate import rate_ratio as compute_ratio, severity_tier
+
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    segs = job.get("segments") or []
+    if not segs:
+        return {"rebalance": None, "optimize": None, "message": "Job has no segments"}
+
+    target_lang = (job.get("language_code") or "vi").lower()
+    do_rebalance = payload.get("rebalance") is not False  # default True
+    rebalance_stats = None
+
+    # ── Step 1: Rebalance Even (cheap, không LLM) ──────────────────────
+    if do_rebalance:
+        max_drift = float(payload.get("max_drift_s") or 1.5)
+        before_stats = cps_summary(segs, target_lang)
+        new_segs, stats = rebalance_even(segs, max_drift_s=max_drift)
+        stats["mode"] = "even"
+
+        # Snapshot trước khi mutate
+        snap_id = f"tl_{uuid.uuid4().hex[:10]}"
+        snapshot = {
+            "id": snap_id,
+            "created_at": time.time(),
+            "mode": "even",
+            "source": "auto-fix",
+            "timings": [
+                {"id": str(s.get("id", i)),
+                 "start": float(s.get("start") or 0.0),
+                 "end": float(s.get("end") or 0.0)}
+                for i, s in enumerate(segs)
+            ],
+        }
+        snapshots = list(job.get("timeline_snapshots") or [])
+        snapshots.append(snapshot)
+        if len(snapshots) > _MAX_TIMELINE_SNAPSHOTS:
+            snapshots = snapshots[-_MAX_TIMELINE_SNAPSHOTS:]
+        job["timeline_snapshots"] = snapshots
+        job["segments"] = new_segs
+        segs = new_segs
+        _save_job(job_id, job)
+
+        rebalance_stats = {
+            "snapshot_id": snap_id,
+            "stats": stats,
+            "before": before_stats,
+            "after": cps_summary(new_segs, target_lang),
+        }
+
+    # ── Step 2: Optimize batch các seg vẫn out-of-range ────────────────
+    optimize_payload = {
+        "severities": payload.get("severities") or ["critical", "warn", "short"],
+        "genre_id": payload.get("genre_id") or job.get("genre_id"),
+        "concurrency": payload.get("concurrency") or 3,
+    }
+    optimize_result = await optimize_batch(job_id, optimize_payload)
+
+    # Reload job sau khi optimize_batch đã _save_job (text mutations).
+    # Caller cần segments mới nhất để update UI cả timing (rebalance) lẫn text
+    # (optimize) trong 1 round trip.
+    final_job = _get_job(job_id)
+    final_segs = final_job.get("segments") if final_job else segs
+
+    return {
+        "rebalance": rebalance_stats,
+        "optimize": optimize_result,
+        "segments": final_segs,
+    }
+
+
 @router.post("/dub/segment/rate-check")
 async def rate_check_segment(payload: dict):
     """Tính nhanh ratio + severity cho 1 segment — không gọi LLM.

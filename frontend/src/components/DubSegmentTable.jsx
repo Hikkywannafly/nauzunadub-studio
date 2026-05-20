@@ -2,10 +2,20 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { List } from 'react-window';
 import DubSegmentRow from './DubSegmentRow';
 import { Table, Select } from '../ui';
+import { rateRatio as computeRateRatio, severityTier } from '../api/segmentRate';
 import './DubSegmentTable.css';
 
-const BASE_ROW_HEIGHT = 28;
-const ROW_HEIGHT_WITH_ORIG = 44;
+// ── Row-height math ───────────────────────────────────────────────────
+// react-window needs a precise height per row else content bleeds into
+// the next row's slot. We compute MAX of text-col and time-col heights:
+//   - text col grows by ORIG_LINE_H when text_original ≠ text
+//   - time col grows by BADGE_LINE_H per stacked badge (sync / rate / fit)
+//
+// Numbers tuned to actual rendered heights in DubSegmentRow.css. If you
+// change badge font-size or padding, retune these or rows will misalign.
+const BASE_ROW_HEIGHT = 28;       // baseline: input + row padding
+const ORIG_LINE_H = 14;           // .seg-orig-row (font 0.55rem + gap)
+const BADGE_LINE_H = 13;          // .seg-sync/rate/fit-badge (font ~0.5rem + 2px margin)
 
 // Spkr column: 75px is the sweet spot — fits "Speaker 1" without ellipsis,
 // doesn't crowd Text. Inline edit is still allowed so users can rename a
@@ -66,8 +76,31 @@ export default function DubSegmentTable({
   const rowHeight = useCallback((index) => {
     const s = filtered[index];
     if (!s) return BASE_ROW_HEIGHT;
-    return (s.text_original && s.text_original !== s.text) ? ROW_HEIGHT_WITH_ORIG : BASE_ROW_HEIGHT;
-  }, [filtered]);
+
+    // Text column extras
+    const hasOrig = !!s.text_original && s.text_original !== s.text;
+    const textExtra = hasOrig ? ORIG_LINE_H : 0;
+
+    // Time column extras: count badges that DubSegmentRow will render.
+    // Logic must mirror DubSegmentRow.jsx visibility conditions exactly,
+    // else row height under/over-estimates → bleed into next row.
+    let badgeCount = 0;
+    if (s.sync_ratio !== undefined) badgeCount++;
+    if (s.rate_ratio != null && Math.abs(s.rate_ratio - 1.0) > 0.03) badgeCount++;
+    // Fit badge: only when translated + severity != ok + text non-empty + slot > 0
+    if (hasOrig) {
+      const slot = Math.max(0, (s.end ?? 0) - (s.start ?? 0));
+      const text = (s.text || '').trim();
+      if (text.length > 0 && slot > 0) {
+        const lang = (s.target_lang || dubLangCode || 'vi').toLowerCase();
+        const ratio = computeRateRatio(s.text || '', slot, lang);
+        if (severityTier(ratio) !== 'ok') badgeCount++;
+      }
+    }
+    const timeExtra = badgeCount * BADGE_LINE_H;
+
+    return BASE_ROW_HEIGHT + Math.max(textExtra, timeExtra);
+  }, [filtered, dubLangCode]);
 
   const rowProps = useMemo(() => ({
     filtered, profiles, speakerClones, disabled, dubStep, dubProgress, previewLoadingId,
