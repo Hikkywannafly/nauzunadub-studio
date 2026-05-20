@@ -138,6 +138,24 @@ export default function DubTab(props) {
     waveformRef.current?.seekTo?.(time);
   }, []);
 
+  // ── Bulk-delete keyboard shortcut ─────────────────────────────────────────
+  // Delete / Backspace xóa selected segments khi focus KHÔNG ở field text.
+  // Loại trừ input/textarea/select/contenteditable để không phá phím editing.
+  useEffect(() => {
+    if (!selectedSegIds || selectedSegIds.size === 0) return;
+    const onKey = (e) => {
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      const t = e.target;
+      if (!t) return;
+      const tag = (t.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable) return;
+      e.preventDefault();
+      bulkDeleteSelected();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedSegIds, bulkDeleteSelected]);
+
   // ── Generating overlay ETA ────────────────────────────────────────────────
   const [genElapsed, setGenElapsed] = useState(0);
   useEffect(() => {
@@ -413,7 +431,7 @@ export default function DubTab(props) {
                     <option value="__def__">(Default)</option>
                     {LANG_CODES.map(lc => <option key={lc.code} value={lc.code}>{lc.code.toUpperCase()}</option>)}
                   </select>
-                  <Button variant="danger" size="sm" onClick={bulkDeleteSelected}>Delete</Button>
+                  <Button variant="danger" size="sm" onClick={bulkDeleteSelected} title="Delete selected (Del)">Delete</Button>
                   <Button variant="ghost"  size="sm" onClick={clearSegSelection} className="dub-bulk-row__clear">Clear</Button>
                 </div>
               )}
