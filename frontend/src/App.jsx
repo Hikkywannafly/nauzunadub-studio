@@ -624,9 +624,13 @@ function App() {
       if (opts.sub_snapshot_id) q.set('sub_snapshot_id', opts.sub_snapshot_id);
       if (opts.sub_position) q.set('sub_position', opts.sub_position);
       if (opts.sub_margin_v != null) q.set('sub_margin_v', String(opts.sub_margin_v));
+      if (opts.sub_margin_v_pct != null) q.set('sub_margin_v_pct', String(opts.sub_margin_v_pct));
       if (opts.sub_font_size != null) q.set('sub_font_size', String(opts.sub_font_size));
       if (opts.sub_bg_color) q.set('sub_bg_color', opts.sub_bg_color);
       if (opts.sub_bg_opacity != null) q.set('sub_bg_opacity', String(opts.sub_bg_opacity));
+      if (opts.sub_max_chars_per_line != null) q.set('sub_max_chars_per_line', String(opts.sub_max_chars_per_line));
+      if (opts.sub_max_lines != null) q.set('sub_max_lines', String(opts.sub_max_lines));
+      if (opts.sub_max_cue_duration != null) q.set('sub_max_cue_duration', String(opts.sub_max_cue_duration));
     }
     triggerDownload(`${API}/dub/download/${dubJobId}/dubbed_video.mp4?${q.toString()}`, 'dubbed_video.mp4');
   };

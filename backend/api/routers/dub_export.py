@@ -159,28 +159,84 @@ async def dub_list_tracks(job_id: str):
     return {"tracks": job.get("dubbed_tracks", {})}
 
 
-def _write_burn_srt(
+def _format_ass_time(seconds: float) -> str:
+    """ASS dialogue time format: H:MM:SS.CC (centiseconds, single-digit hours)."""
+    s = max(0.0, float(seconds))
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = s - h * 3600 - m * 60
+    return f"{h}:{m:02d}:{sec:05.2f}"
+
+
+def _srt_italic_to_ass(text: str) -> str:
+    """Convert `<i>...</i>` (SRT/HTML) to ASS inline `{\\i1}...{\\i0}` + escape ASS-special chars."""
+    import re
+    # Escape backslash + curly braces before italic substitution (else our own
+    # `{\i1}` tags get re-escaped).
+    text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    text = re.sub(r"<i>(.*?)</i>", r"{\\i1}\1{\\i0}", text, flags=re.DOTALL | re.IGNORECASE)
+    # ASS treats literal newlines as line breaks only via `\N` token.
+    text = text.replace("\n", "\\N")
+    return text
+
+
+def _write_burn_subs(
     job: dict, exports_dir: str, stamp: str, dual: bool,
     snapshot_id: Optional[str] = None,
+    max_chars_per_line: int = 32,
+    max_lines: int = 2,
+    max_cue_duration: float = 4.0,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
 ) -> str | None:
-    """Build a temp SRT from job segments for use with ffmpeg's subtitles filter.
+    """Write an .ass file for ffmpeg's subtitles filter.
 
-    Returned path is already ffmpeg-filter-safe (plain ASCII basename under exports_dir).
-    Returns None if there are no segments to render. `snapshot_id` lets the
-    burn-in pick a non-current translation language.
+    Why ASS instead of SRT here:
+      Khi ffmpeg consume SRT, libass dùng PlayResY mặc định = 288. FontSize=28
+      tưởng là 28px nhưng thực tế render ở (28 / 288) ≈ 10%% chiều cao video
+      → trên video 1080×1920 ra ~190px text khổng lồ, lệch hẳn preview.
+      Bằng cách emit ASS với PlayResX/Y khớp video gốc, FontSize/MarginV được
+      hiểu đúng theo pixel space của frame → preview WYSIWYG.
+
+    Returns None if there are no segments to render. Path là ASCII basename
+    nằm trong exports_dir → ffmpeg-filter-safe.
     """
     segments = _resolve_subtitle_segments(job, snapshot_id)
     if not segments:
         return None
-    lines = []
-    for i, seg in enumerate(segments):
-        lines.append(str(i + 1))
-        lines.append(f"{_format_srt_time(seg['start'])} --> {_format_srt_time(seg['end'])}")
-        lines.append(_pick_subtitle_text(seg, dual))
-        lines.append("")
-    sub_path = os.path.join(exports_dir, f"burn_subs_{stamp}.srt")
+    cues = _build_subtitle_cues(segments, dual, max_chars_per_line, max_lines, max_cue_duration)
+    if not cues:
+        return None
+    # Base Style chỉ đặt placeholder — Alignment/MarginV/FontSize/BorderStyle
+    # đều bị `force_style` từ caller override khi gọi subtitles filter. Giữ
+    # default sane để nếu force_style fail thì vẫn xem được.
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {int(play_res_x)}\n"
+        f"PlayResY: {int(play_res_y)}\n"
+        "ScaledBorderAndShadow: yes\n"
+        "WrapStyle: 0\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+        "1,0,0,0,100,100,0,0,1,2,1,2,40,40,20,1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    body_lines = []
+    for start, end, text in cues:
+        ass_text = _srt_italic_to_ass(text)
+        body_lines.append(
+            f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{ass_text}"
+        )
+    sub_path = os.path.join(exports_dir, f"burn_subs_{stamp}.ass")
     with open(sub_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write(header + "\n".join(body_lines) + "\n")
     return sub_path
 
 
@@ -214,6 +270,33 @@ def _hex_to_ass_color(hex_str: str, opacity_pct: int) -> str:
     # ASS alpha: 00 = opaque, FF = transparent. Invert from opacity %.
     aa = round((100 - op) * 255 / 100)
     return f"&H{aa:02X}{b:02X}{g:02X}{r:02X}"
+
+
+def _probe_video_dims(video_path: str) -> tuple[int, int]:
+    """Read the video's (width, height) in pixels. Returns (0, 0) on failure.
+
+    Burn-in ASS file embeds these as PlayResX/PlayResY so FontSize/MarginV
+    are interpreted in actual video pixel space (else libass falls back to
+    PlayResY=288 default → tiny FontSize ends up huge on tall video).
+    """
+    from services.ffmpeg_utils import find_ffprobe
+    probe = find_ffprobe()
+    if not probe:
+        return (0, 0)
+    try:
+        import subprocess, json
+        out = subprocess.check_output(
+            [probe, "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", video_path],
+            timeout=10,
+        )
+        data = json.loads(out)
+        streams = data.get("streams", [])
+        if streams:
+            return (int(streams[0].get("width") or 0), int(streams[0].get("height") or 0))
+    except Exception:
+        pass
+    return (0, 0)
 
 
 def _build_burn_style(
@@ -367,10 +450,14 @@ async def dub_download(
     dual: bool = Query(False, description="When burn_subs=1, render translated on top of italicised original."),
     sub_snapshot_id: Optional[str] = Query(None, description="Translation snapshot id để chọn ngôn ngữ sub burn-in."),
     sub_position: str = Query("bottom", description="bottom | middle | top — vị trí dọc của burn-in subtitle."),
-    sub_margin_v: int = Query(20, description="Margin từ cạnh anchor (pixel). 0-500."),
+    sub_margin_v: int = Query(20, description="Margin từ cạnh anchor (pixel). 0-500. Bị override bởi sub_margin_v_pct nếu > 0."),
+    sub_margin_v_pct: float = Query(0.0, description="Margin từ cạnh anchor theo %% video height (0-50). > 0 sẽ override sub_margin_v."),
     sub_font_size: int = Query(24, description="Font size cho burn-in. 10-80."),
     sub_bg_color: str = Query("", description="Hex màu nền sub (#RRGGBB). Rỗng = không có nền."),
     sub_bg_opacity: int = Query(0, description="Opacity nền sub 0-100%. 0 = không có nền."),
+    sub_max_chars_per_line: int = Query(32, description="Max ký tự / dòng — segs dài tự split."),
+    sub_max_lines: int = Query(2, description="Max dòng / cue."),
+    sub_max_cue_duration: float = Query(4.0, description="Max giây / cue. Cue dài hơn tự split để bám nhịp đọc."),
 ):
     job = _get_job(job_id)
     if not job:
@@ -398,7 +485,25 @@ async def dub_download(
     output_path = os.path.join(exports_dir, f"dubbed_video_{stamp}.mp4")
     ffmpeg = find_ffmpeg()
 
-    sub_path = _write_burn_srt(job, exports_dir, stamp, dual, sub_snapshot_id) if burn_subs else None
+    # Probe video dims once — used for both ASS PlayResY embedding AND
+    # converting % margin to pixel margin in PlayResY space.
+    # to_thread vì subprocess.check_output là sync, đừng block event loop khi
+    # nhiều job download song song.
+    video_w, video_h = await asyncio.to_thread(_probe_video_dims, video_path) if burn_subs else (0, 0)
+
+    sub_path = _write_burn_subs(
+        job, exports_dir, stamp, dual, sub_snapshot_id,
+        sub_max_chars_per_line, sub_max_lines, sub_max_cue_duration,
+        play_res_x=video_w or 1920,
+        play_res_y=video_h or 1080,
+    ) if burn_subs else None
+
+    # Resolve margin: pct > 0 → convert to px theo height của source video.
+    # ASS MarginV nằm trong PlayResY space (= video height nhờ ASS header).
+    effective_margin_v = sub_margin_v
+    if burn_subs and sub_margin_v_pct and sub_margin_v_pct > 0 and video_h > 0:
+        pct = max(0.0, min(50.0, float(sub_margin_v_pct)))
+        effective_margin_v = int(round(video_h * pct / 100.0))
 
     cmd = [ffmpeg, "-i", video_path]
     input_idx = 1
@@ -423,7 +528,7 @@ async def dub_download(
     video_map = "0:v:0"
     if sub_path:
         esc = _ffmpeg_filter_escape(sub_path)
-        style = _build_burn_style(sub_position, sub_margin_v, sub_font_size, sub_bg_color, sub_bg_opacity)
+        style = _build_burn_style(sub_position, effective_margin_v, sub_font_size, sub_bg_color, sub_bg_opacity)
         filter_parts.append(f"[0:v]subtitles='{esc}':force_style='{style}'[vout]")
         video_map = "[vout]"
 
@@ -728,6 +833,137 @@ def _pick_subtitle_text(seg: dict, dual: bool) -> str:
     return f"{translated}\n<i>{original}</i>"
 
 
+_SENTENCE_END_RE = None
+
+
+def _wrap_text_for_subtitle(text: str, max_chars_per_line: int, max_lines: int) -> list[str]:
+    """Break a long string into chunks each ≤ max_lines × max_chars_per_line.
+
+    Strategy:
+      1. Sentence boundary (., !, ?, 。, ！, ？) là chỗ split ưu tiên.
+      2. Trong mỗi câu, wrap thành nhiều dòng ≤ max_chars_per_line, ưu tiên
+         space. Tránh cắt giữa từ.
+      3. Mỗi chunk gom đủ max_lines dòng rồi mới sang chunk mới.
+    """
+    import re
+    if max_chars_per_line <= 0 or max_lines <= 0:
+        return [text]
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    # Tách câu giữ luôn dấu kết
+    sentence_re = re.compile(r'[^.!?。！？]+[.!?。！？]?', re.UNICODE)
+    raw_sentences = [s.strip() for s in sentence_re.findall(text) if s.strip()]
+    if not raw_sentences:
+        raw_sentences = [text]
+
+    # Wrap từng câu → list[str] line
+    all_lines: list[str] = []
+    for sentence in raw_sentences:
+        words = sentence.split()
+        if not words:
+            continue
+        current = ""
+        for w in words:
+            # Từ dài hơn max → đành nhả 1 dòng riêng (không cắt mid-word)
+            if len(w) > max_chars_per_line:
+                if current:
+                    all_lines.append(current)
+                    current = ""
+                all_lines.append(w)
+                continue
+            candidate = (current + " " + w).strip() if current else w
+            if len(candidate) <= max_chars_per_line:
+                current = candidate
+            else:
+                all_lines.append(current)
+                current = w
+        if current:
+            all_lines.append(current)
+
+    # Gom các dòng thành chunks ≤ max_lines dòng/chunk
+    chunks: list[str] = []
+    for i in range(0, len(all_lines), max_lines):
+        chunks.append("\n".join(all_lines[i:i + max_lines]))
+    return chunks or [text]
+
+
+def _split_segment_into_cues(
+    seg: dict, dual: bool, max_chars_per_line: int, max_lines: int,
+    max_cue_duration: float = 4.0,
+) -> list[tuple[float, float, str]]:
+    """Split 1 seg thành nhiều cue dạng (start, end, text).
+
+    Time phân bố theo char count của từng chunk. Khi dual=True và có
+    `text_original`, chunk theo text translated rồi giữ original cho TỪNG chunk
+    (lấy chunk tương ứng — proportional split để 2 ngôn ngữ vẫn align).
+
+    `max_cue_duration` (s): nếu sau khi wrap, avg duration/chunk > limit này,
+    re-wrap với max_lines=1 để sub flow theo nhịp đọc thay vì đứng yên cả câu.
+    """
+    start = float(seg.get("start") or 0.0)
+    end = float(seg.get("end") or start)
+    duration = max(0.001, end - start)
+
+    translated = (seg.get("text") or "").strip()
+    original = (seg.get("text_original") or "").strip()
+
+    primary = translated or original
+    chunks = _wrap_text_for_subtitle(primary, max_chars_per_line, max_lines)
+    if not chunks:
+        return []
+
+    # Pacing guard: chunks quá ít so với duration → sub dai. Force re-wrap với
+    # max_lines=1 nếu avg > max_cue_duration. Nếu vẫn dai (1 chunk = nguyên seg
+    # ngắn text), split thêm bằng cách halving lines.
+    effective_max_lines = max_lines
+    if max_cue_duration > 0 and duration / len(chunks) > max_cue_duration and max_lines > 1:
+        chunks = _wrap_text_for_subtitle(primary, max_chars_per_line, 1)
+        effective_max_lines = 1
+
+    # Pre-wrap original once, không gọi trong loop. Khi len(orig) ≠ len(chunks),
+    # map proportional index để tránh vừa repeat dòng cuối vừa drop dòng giữa.
+    orig_chunks: list[str] = []
+    if dual and original and original != translated:
+        orig_chunks = _wrap_text_for_subtitle(original, max_chars_per_line, effective_max_lines)
+
+    # Time allocation theo char weight, tổng = duration
+    weights = [max(1, len(c.replace("\n", " "))) for c in chunks]
+    total_w = sum(weights)
+    cues: list[tuple[float, float, str]] = []
+    cursor = start
+    n_chunks = len(chunks)
+    for i, (chunk, w) in enumerate(zip(chunks, weights)):
+        share = duration * (w / total_w)
+        c_start = cursor
+        c_end = end if i == n_chunks - 1 else min(end, cursor + share)
+        cursor = c_end
+        text_for_cue = chunk
+        if orig_chunks:
+            # Proportional index map: chunk i → orig_chunks[ round(i / N * M) ]
+            # đảm bảo monotonic non-decreasing, không bỏ giữa cũng không repeat lệch.
+            orig_idx = min(len(orig_chunks) - 1, int(i * len(orig_chunks) / max(1, n_chunks)))
+            text_for_cue = f"{chunk}\n<i>{orig_chunks[orig_idx]}</i>"
+        cues.append((c_start, c_end, text_for_cue))
+    return cues
+
+
+def _build_subtitle_cues(
+    segments: list[dict], dual: bool,
+    max_chars_per_line: int = 32, max_lines: int = 2,
+    max_cue_duration: float = 4.0,
+) -> list[tuple[float, float, str]]:
+    """Build all cues for all segs, in chronological order. Each seg may produce
+    multiple cues when its text exceeds the per-cue budget."""
+    out: list[tuple[float, float, str]] = []
+    for seg in segments:
+        out.extend(_split_segment_into_cues(
+            seg, dual, max_chars_per_line, max_lines, max_cue_duration,
+        ))
+    return out
+
+
 def _resolve_subtitle_segments(job: dict, snapshot_id: Optional[str]) -> list[dict]:
     """Build the list of segments to render as subtitle cues.
 
@@ -766,6 +1002,9 @@ async def dub_export_srt(
     job_id: str,
     dual: bool = False,
     snapshot_id: Optional[str] = Query(None, description="Translation snapshot id để chọn ngôn ngữ sub (default = current segments)"),
+    max_chars_per_line: int = Query(32, description="Max ký tự / dòng. SRT chuẩn ≤42, hẹp hơn cho Reels/Shorts."),
+    max_lines: int = Query(2, description="Max dòng / cue. Sub thường 2 dòng."),
+    max_cue_duration: float = Query(4.0, description="Max giây / cue. Cue dài hơn tự split."),
 ):
     job = _get_job(job_id)
     if not job:
@@ -775,13 +1014,12 @@ async def dub_export_srt(
     if not segments:
         raise HTTPException(status_code=400, detail="No transcript segments available")
 
+    cues = _build_subtitle_cues(segments, dual, max_chars_per_line, max_lines, max_cue_duration)
     srt_lines = []
-    for i, seg in enumerate(segments):
-        start_ts = _format_srt_time(seg["start"])
-        end_ts = _format_srt_time(seg["end"])
+    for i, (start, end, text) in enumerate(cues):
         srt_lines.append(f"{i + 1}")
-        srt_lines.append(f"{start_ts} --> {end_ts}")
-        srt_lines.append(_pick_subtitle_text(seg, dual))
+        srt_lines.append(f"{_format_srt_time(start)} --> {_format_srt_time(end)}")
+        srt_lines.append(text)
         srt_lines.append("")
 
     srt_content = "\n".join(srt_lines)
@@ -806,6 +1044,9 @@ async def dub_export_vtt(
     job_id: str,
     dual: bool = False,
     snapshot_id: Optional[str] = Query(None, description="Translation snapshot id để chọn ngôn ngữ sub"),
+    max_chars_per_line: int = Query(32),
+    max_lines: int = Query(2),
+    max_cue_duration: float = Query(4.0),
 ):
     job = _get_job(job_id)
     if not job:
@@ -815,13 +1056,12 @@ async def dub_export_vtt(
     if not segments:
         raise HTTPException(status_code=400, detail="No transcript segments available")
 
+    cues = _build_subtitle_cues(segments, dual, max_chars_per_line, max_lines, max_cue_duration)
     vtt_lines = ["WEBVTT", ""]
-    for i, seg in enumerate(segments):
-        start_ts = _format_vtt_time(seg["start"])
-        end_ts = _format_vtt_time(seg["end"])
+    for i, (start, end, text) in enumerate(cues):
         vtt_lines.append(str(i + 1))
-        vtt_lines.append(f"{start_ts} --> {end_ts}")
-        vtt_lines.append(_pick_subtitle_text(seg, dual))
+        vtt_lines.append(f"{_format_vtt_time(start)} --> {_format_vtt_time(end)}")
+        vtt_lines.append(text)
         vtt_lines.append("")
 
     vtt_content = "\n".join(vtt_lines)

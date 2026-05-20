@@ -57,11 +57,21 @@ export default function ExportModal({
   const [subsSnapshotId, setSubsSnapshotId] = useState('');
   // Burn-in position config (chỉ dùng khi burnSubs=true)
   const [subPosition, setSubPosition] = useState('bottom'); // bottom | middle | top
+  // Margin: hai mode. Pct (% video height) là default — portable cross-resolution.
+  // Px giữ lại cho user nào quen với absolute, toggle qua subMarginMode.
+  const [subMarginMode, setSubMarginMode] = useState('pct'); // 'pct' | 'px'
+  const [subMarginVPct, setSubMarginVPct] = useState(8); // % of video height
   const [subMarginV, setSubMarginV] = useState(20);
   const [subFontSize, setSubFontSize] = useState(24);
   // Subtitle background box (ASS BorderStyle=3) — off khi opacity=0
   const [subBgColor, setSubBgColor] = useState('#000000');
   const [subBgOpacity, setSubBgOpacity] = useState(0); // 0 = no BG box
+  // Subtitle line wrapping: segs dài chia thành nhiều cue ≤ N ký tự × M dòng.
+  // 32×2 phù hợp Reels/Shorts; tăng lên 42 cho 16:9 truyền thống.
+  const [subMaxChars, setSubMaxChars] = useState(32);
+  const [subMaxLines, setSubMaxLines] = useState(2);
+  // Max giây / cue → buộc split khi sub đứng yên quá lâu so với nhịp đọc
+  const [subMaxCueDuration, setSubMaxCueDuration] = useState(4);
   // Background audio config
   const [bgSource, setBgSource] = useState('original'); // original | custom | off
   const [bgVolume, setBgVolume] = useState(80);         // 0-200 %, divided by 100 trên URL
@@ -209,12 +219,19 @@ export default function ExportModal({
     if (burnSubs) {
       if (subsSnapshotId) opts.sub_snapshot_id = subsSnapshotId;
       opts.sub_position = subPosition;
-      opts.sub_margin_v = subMarginV;
+      if (subMarginMode === 'pct') {
+        opts.sub_margin_v_pct = subMarginVPct;
+      } else {
+        opts.sub_margin_v = subMarginV;
+      }
       opts.sub_font_size = subFontSize;
       if (subBgOpacity > 0) {
         opts.sub_bg_color = subBgColor;
         opts.sub_bg_opacity = subBgOpacity;
       }
+      opts.sub_max_chars_per_line = subMaxChars;
+      opts.sub_max_lines = subMaxLines;
+      opts.sub_max_cue_duration = subMaxCueDuration;
     }
     handleDubDownload?.(opts);
     onClose?.();
@@ -252,7 +269,12 @@ export default function ExportModal({
     const exportOne = (lang, snapId) => {
       formats.forEach((ext) => {
         const name = `subtitles${subsDual ? '_dual' : ''}_${lang}.${ext}`;
-        const q = new URLSearchParams({ dual: subsDual ? '1' : '0' });
+        const q = new URLSearchParams({
+          dual: subsDual ? '1' : '0',
+          max_chars_per_line: String(subMaxChars),
+          max_lines: String(subMaxLines),
+          max_cue_duration: String(subMaxCueDuration),
+        });
         if (snapId) q.set('snapshot_id', snapId);
         const url = `${API}/dub/${ext}/${jobId}/${name}?${q.toString()}`;
         triggerDownload?.(url, name);
@@ -406,113 +428,178 @@ export default function ExportModal({
                   Burn subtitles into picture (hardsub)
                 </label>
                 {burnSubs && (
-                  <>
-                    <label className="export-modal__toggle export-modal__toggle--indent">
-                      <input type="checkbox" checked={!!dualSubs} onChange={e => setDualSubs(e.target.checked)} />
-                      Dual (translated on top of italicised original)
-                    </label>
-                    {translationSnapshots.length > 0 && (
-                      <div className="export-modal__sub-row">
-                        <label className="export-modal__sub-label">Language</label>
-                        <select
-                          className="input-base input-base--xs"
-                          value={subsSnapshotId}
-                          onChange={(e) => setSubsSnapshotId(e.target.value)}
-                        >
-                          <option value="">Current ({dubLangCode || '—'})</option>
-                          {translationSnapshots.map((s) => (
-                            <option key={s.id} value={s.id}>
-                              {(s.target_lang || '?').toUpperCase()} · {s.provider || '—'} · {s.quality || 'fast'}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-                    <div className="export-modal__sub-row">
-                      <label className="export-modal__sub-label">Position</label>
-                      <Segmented
-                        size="sm"
-                        value={subPosition}
-                        onChange={setSubPosition}
-                        items={[
-                          { value: 'bottom', label: 'Bottom' },
-                          { value: 'middle', label: 'Middle' },
-                          { value: 'top', label: 'Top' },
-                        ]}
-                      />
-                    </div>
-                    <div className="export-modal__sub-row">
-                      <label className="export-modal__sub-label">
-                        Margin <span style={{ fontFamily: 'monospace' }}>{subMarginV}px</span>
+                  <div className="export-modal__sub-layout">
+                    <div className="export-modal__sub-controls">
+                      <label className="export-modal__toggle">
+                        <input type="checkbox" checked={!!dualSubs} onChange={e => setDualSubs(e.target.checked)} />
+                        Dual (translated on top of italicised original)
                       </label>
-                      <input
-                        type="range" min="0" max="200" step="5"
-                        value={subMarginV}
-                        onChange={(e) => setSubMarginV(Number(e.target.value))}
-                        style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
-                      />
+
+                      {translationSnapshots.length > 0 && (
+                        <SubGroup title="Source">
+                          <SubRow label="Language">
+                            <select
+                              className="input-base input-base--xs"
+                              value={subsSnapshotId}
+                              onChange={(e) => setSubsSnapshotId(e.target.value)}
+                              style={{ flex: 1 }}
+                            >
+                              <option value="">Current ({dubLangCode || '—'})</option>
+                              {translationSnapshots.map((s) => (
+                                <option key={s.id} value={s.id}>
+                                  {(s.target_lang || '?').toUpperCase()} · {s.provider || '—'} · {s.quality || 'fast'}
+                                </option>
+                              ))}
+                            </select>
+                          </SubRow>
+                        </SubGroup>
+                      )}
+
+                      <SubGroup title="Position">
+                        <SubRow label="Anchor">
+                          <Segmented
+                            size="sm"
+                            value={subPosition}
+                            onChange={setSubPosition}
+                            items={[
+                              { value: 'bottom', label: 'Bottom' },
+                              { value: 'middle', label: 'Middle' },
+                              { value: 'top', label: 'Top' },
+                            ]}
+                          />
+                        </SubRow>
+                        <SubRow label="Unit">
+                          <Segmented
+                            size="sm"
+                            value={subMarginMode}
+                            onChange={setSubMarginMode}
+                            items={[
+                              { value: 'pct', label: '% of video' },
+                              { value: 'px', label: 'Pixels' },
+                            ]}
+                          />
+                        </SubRow>
+                        {subMarginMode === 'pct' ? (
+                          <SubRow label={<>Margin <code>{subMarginVPct.toFixed(1)}%</code></>}>
+                            <input
+                              type="range" min="0" max="50" step="0.5"
+                              value={subMarginVPct}
+                              onChange={(e) => setSubMarginVPct(Number(e.target.value))}
+                              className="export-modal__slider"
+                            />
+                          </SubRow>
+                        ) : (
+                          <SubRow label={<>Margin <code>{subMarginV}px</code></>}>
+                            <input
+                              type="range" min="0" max="500" step="5"
+                              value={subMarginV}
+                              onChange={(e) => setSubMarginV(Number(e.target.value))}
+                              className="export-modal__slider"
+                            />
+                          </SubRow>
+                        )}
+                        <div className="export-modal__sub-hint">
+                          Kéo trực tiếp dòng sub trong preview để chỉnh đúng vị trí muốn che sub gốc.
+                        </div>
+                      </SubGroup>
+
+                      <SubGroup title="Typography">
+                        <SubRow label={<>Font size <code>{subFontSize}px</code></>}>
+                          <input
+                            type="range" min="12" max="120" step="2"
+                            value={subFontSize}
+                            onChange={(e) => setSubFontSize(Number(e.target.value))}
+                            className="export-modal__slider"
+                          />
+                        </SubRow>
+                        <div className="export-modal__sub-hint">
+                          Px là chiều cao thực trên video gốc. Video 1080×1920 thử 48-72px, 1920×1080 thử 28-40px.
+                        </div>
+                      </SubGroup>
+
+                      <SubGroup title="Background box">
+                        <SubRow label="Color">
+                          <input
+                            type="color"
+                            value={subBgColor}
+                            onChange={(e) => setSubBgColor(e.target.value)}
+                            className="export-modal__color"
+                          />
+                          <code className="export-modal__mono-dim">{subBgColor}</code>
+                        </SubRow>
+                        <SubRow label={<>Opacity <code>{subBgOpacity}%</code></>}>
+                          <input
+                            type="range" min="0" max="100" step="5"
+                            value={subBgOpacity}
+                            onChange={(e) => setSubBgOpacity(Number(e.target.value))}
+                            className="export-modal__slider"
+                          />
+                          {subBgOpacity > 0 && (
+                            <button
+                              type="button"
+                              className="export-modal__off-btn"
+                              onClick={() => setSubBgOpacity(0)}
+                              title="Tắt BG box (về outline-only)"
+                            >Off</button>
+                          )}
+                        </SubRow>
+                      </SubGroup>
+
+                      <SubGroup title="Timing & wrap">
+                        <SubRow label={<>Max cue <code>{subMaxCueDuration}s</code></>}>
+                          <input
+                            type="range" min="1.5" max="8" step="0.5"
+                            value={subMaxCueDuration}
+                            onChange={(e) => setSubMaxCueDuration(Number(e.target.value))}
+                            className="export-modal__slider"
+                          />
+                        </SubRow>
+                        <SubRow label={<>Chars / line <code>{subMaxChars}</code></>}>
+                          <input
+                            type="range" min="20" max="60" step="1"
+                            value={subMaxChars}
+                            onChange={(e) => setSubMaxChars(Number(e.target.value))}
+                            className="export-modal__slider"
+                          />
+                        </SubRow>
+                        <SubRow label={<>Lines <code>{subMaxLines}</code></>}>
+                          <input
+                            type="range" min="1" max="3" step="1"
+                            value={subMaxLines}
+                            onChange={(e) => setSubMaxLines(Number(e.target.value))}
+                            className="export-modal__slider"
+                          />
+                        </SubRow>
+                        <div className="export-modal__sub-hint">
+                          Giảm <code>max cue</code> nếu sub đứng yên lâu hơn nhịp đọc. 32 ký tự / dòng phù hợp Reels/Shorts.
+                        </div>
+                      </SubGroup>
                     </div>
-                    <div className="export-modal__sub-row">
-                      <label className="export-modal__sub-label">
-                        Font size <span style={{ fontFamily: 'monospace' }}>{subFontSize}pt</span>
-                      </label>
-                      <input
-                        type="range" min="12" max="60" step="2"
-                        value={subFontSize}
-                        onChange={(e) => setSubFontSize(Number(e.target.value))}
-                        style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
-                      />
-                    </div>
-                    <div className="export-modal__sub-row">
-                      <label className="export-modal__sub-label">BG color</label>
-                      <input
-                        type="color"
-                        value={subBgColor}
-                        onChange={(e) => setSubBgColor(e.target.value)}
-                        style={{
-                          width: 32, height: 28, padding: 0, border: '1px solid var(--chrome-border)',
-                          borderRadius: 4, background: 'transparent', cursor: 'pointer',
+                    <div className="export-modal__sub-preview-wrap">
+                      <SubtitlePreview
+                        jobId={jobId}
+                        dubLangCode={dubLangCode}
+                        snapshotId={subsSnapshotId || undefined}
+                        position={subPosition}
+                        marginV={subMarginV}
+                        marginVPct={subMarginMode === 'pct' ? subMarginVPct : 0}
+                        fontSize={subFontSize}
+                        dual={subsDual}
+                        bgColor={subBgColor}
+                        bgOpacity={subBgOpacity}
+                        maxCharsPerLine={subMaxChars}
+                        maxLines={subMaxLines}
+                        maxCueDuration={subMaxCueDuration}
+                        apiBase={API}
+                        draggable={subMarginMode === 'pct'}
+                        onMarginChange={(pct, nextPos) => {
+                          setSubMarginMode('pct');
+                          setSubMarginVPct(pct);
+                          if (nextPos && nextPos !== subPosition) setSubPosition(nextPos);
                         }}
                       />
-                      <span style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--chrome-fg-muted)' }}>
-                        {subBgColor}
-                      </span>
-                      <span style={{ width: 8 }} />
-                      <label className="export-modal__sub-label" style={{ minWidth: 'auto' }}>
-                        Opacity <span style={{ fontFamily: 'monospace' }}>{subBgOpacity}%</span>
-                      </label>
-                      <input
-                        type="range" min="0" max="100" step="5"
-                        value={subBgOpacity}
-                        onChange={(e) => setSubBgOpacity(Number(e.target.value))}
-                        style={{ flex: 1, accentColor: 'var(--accent, #d3869b)' }}
-                      />
-                      {subBgOpacity > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => setSubBgOpacity(0)}
-                          style={{
-                            padding: '2px 8px', fontSize: 11, background: 'transparent',
-                            color: 'var(--chrome-fg-muted)', border: '1px solid var(--chrome-border)',
-                            borderRadius: 4, cursor: 'pointer',
-                          }}
-                          title="Tắt BG box (về outline-only)"
-                        >Off</button>
-                      )}
                     </div>
-                    <SubtitlePreview
-                      jobId={jobId}
-                      dubLangCode={dubLangCode}
-                      snapshotId={subsSnapshotId || undefined}
-                      position={subPosition}
-                      marginV={subMarginV}
-                      fontSize={subFontSize}
-                      dual={subsDual}
-                      bgColor={subBgColor}
-                      bgOpacity={subBgOpacity}
-                      apiBase={API}
-                    />
-                  </>
+                  </div>
                 )}
               </Field>
             </div>
@@ -615,10 +702,14 @@ export default function ExportModal({
                 dubLangCode={dubLangCode}
                 snapshotId={subsBatch === 'snapshot' ? subsSnapshotId : undefined}
                 position="bottom"
-                marginV={20}
+                marginVPct={8}
                 fontSize={24}
                 dual={subsDual}
+                maxCharsPerLine={subMaxChars}
+                maxLines={subMaxLines}
+                maxCueDuration={subMaxCueDuration}
                 apiBase={API}
+                draggable={false}
               />
             </div>
           )}
@@ -680,6 +771,24 @@ export default function ExportModal({
       </div>
     </div>,
     document.body,
+  );
+}
+
+function SubGroup({ title, children }) {
+  return (
+    <div className="export-modal__sub-group">
+      <div className="export-modal__sub-group-title">{title}</div>
+      <div className="export-modal__sub-group-body">{children}</div>
+    </div>
+  );
+}
+
+function SubRow({ label, children }) {
+  return (
+    <div className="export-modal__sub-row">
+      <div className="export-modal__sub-row-label">{label}</div>
+      <div className="export-modal__sub-row-control">{children}</div>
+    </div>
   );
 }
 
