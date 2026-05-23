@@ -34,6 +34,25 @@ logger = logging.getLogger("omnivoice.asr")
 # ── Protocol ────────────────────────────────────────────────────────────────
 
 
+# Style-pattern prompts to steer Whisper output for languages that ship without
+# punctuation by default (notably `large-v3` on CJK). Whisper imitates the prompt's
+# style — so we hand it well-punctuated example sentences rather than instructions.
+# Sources: OpenAI whisper discussion #277, faster-whisper issue #662, OpenAI cookbook.
+_LANG_PROMPTS: dict[str, str] = {
+    "zh": "以下是普通话的句子。你好，今天天气怎么样？我很好，谢谢！",
+    "ja": "以下は日本語の文章です。こんにちは、今日はいい天気ですね。お元気ですか？",
+    "ko": "다음은 한국어 문장입니다. 안녕하세요, 오늘 날씨가 좋네요. 잘 지내시죠?",
+    "th": "ต่อไปนี้เป็นประโยคภาษาไทย สวัสดีครับ วันนี้อากาศดีมาก คุณสบายดีไหม?",
+    "vi": "Sau đây là các câu tiếng Việt. Xin chào, hôm nay trời đẹp quá. Bạn có khỏe không?",
+}
+
+
+def _prompt_for(language: Optional[str]) -> Optional[str]:
+    if not language:
+        return None
+    return _LANG_PROMPTS.get(language.lower())
+
+
 class ASRBackend(ABC):
     id: str = "base"
     display_name: str = "Base ASR"
@@ -44,10 +63,21 @@ class ASRBackend(ABC):
         ...
 
     @abstractmethod
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,
+    ) -> dict:
         """Return the raw Whisper output dict. Callers (`segment_transcript`)
         know how to read it — this stays deliberately untyped so new engines
         that already speak the shape plug in with zero adapter work.
+
+        `language` is an optional ISO code hint (e.g. "zh", "ja"). When set,
+        backends inject the matching style-prompt from `_LANG_PROMPTS` and
+        force `condition_on_previous_text=False` — the combo that recovers
+        sentence-ending punctuation lost by `large-v3` on CJK audio.
         """
 
     def unload(self) -> None:
@@ -198,13 +228,30 @@ class WhisperXBackend(ASRBackend):
             self._align_cache[language_code] = None
             return None
 
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,
+    ) -> dict:
         import whisperx
         self._ensure_asr()
-        logger.info("whisperx transcribing %s (word_timestamps=%s)", audio_path, word_timestamps)
+        # WhisperX's own default is `condition_on_previous_text=False` (it bakes
+        # this into asr_options at load), so the largest CJK-punctuation fix is
+        # already in place. The per-language style-prompt is harder here —
+        # whisperx bakes `initial_prompt` at load time, and reloading large-v3
+        # mid-job costs ~3GB of memory churn. Skipping the prompt; the
+        # condition_on_previous_text default plus forced alignment is usually
+        # enough. Users who need prompt-driven CJK punctuation should switch
+        # backend to `faster-whisper` via OMNIVOICE_ASR_BACKEND.
+        logger.info(
+            "whisperx transcribing %s (lang=%s, word_timestamps=%s)",
+            audio_path, language, word_timestamps,
+        )
         audio = whisperx.load_audio(audio_path)
         try:
-            result = self._asr.transcribe(audio)
+            result = self._asr.transcribe(audio, language=language) if language else self._asr.transcribe(audio)
         except IndexError as e:
             # WhisperX pipeline crashes with IndexError if VAD produces 0 segments
             logger.info("whisperx transcribe threw IndexError (likely 0 VAD segments). Returning empty result.")
@@ -309,11 +356,27 @@ class FasterWhisperBackend(ASRBackend):
             self._model_name, device=device, compute_type=compute_type
         )
 
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,
+    ) -> dict:
         self._ensure_model()
+        # If caller didn't pass a language hint, do faster-whisper's cheap
+        # 30s detect pass so we can pick the right style-prompt before the
+        # full transcribe begins. Without this, large-v3 emits CJK with no
+        # punctuation and the segmenter has no boundaries to cut at.
+        if not language:
+            try:
+                language, _prob, _all = self._model.detect_language(audio_path)
+            except Exception as e:
+                logger.debug("detect_language failed (%s) — proceeding without prompt", e)
+        prompt = _prompt_for(language)
         logger.info(
-            "faster-whisper transcribing %s (word_timestamps=%s)",
-            audio_path, word_timestamps,
+            "faster-whisper transcribing %s (lang=%s, prompt=%s, word_timestamps=%s)",
+            audio_path, language, bool(prompt), word_timestamps,
         )
         # faster-whisper returns a generator of Segment objects + an Info
         # struct. Materialise the generator so downstream consumers can
@@ -322,6 +385,9 @@ class FasterWhisperBackend(ASRBackend):
             audio_path,
             word_timestamps=word_timestamps,
             vad_filter=True,  # built-in Silero VAD — cleaner segment starts
+            language=language,
+            initial_prompt=prompt,
+            condition_on_previous_text=False,  # large-v3 zh drifts to no-punct otherwise (issue #662)
         )
         segments = list(segments_iter)
         # Normalise to the shape segment_transcript(...) expects: a dict with
@@ -400,16 +466,26 @@ class MLXWhisperBackend(ASRBackend):
         except ImportError as e:
             return False, f"mlx-whisper not installed: {e}"
 
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,
+    ) -> dict:
         import mlx_whisper
+        prompt = _prompt_for(language)
         logger.info(
-            "MLX Whisper transcribing %s (model=%s, word_timestamps=%s)",
-            audio_path, self._model_name, word_timestamps,
+            "MLX Whisper transcribing %s (model=%s, lang=%s, prompt=%s, word_timestamps=%s)",
+            audio_path, self._model_name, language, bool(prompt), word_timestamps,
         )
         result = mlx_whisper.transcribe(
             audio_path,
             path_or_hf_repo=self._model_name,
             word_timestamps=word_timestamps,
+            language=language,
+            initial_prompt=prompt,
+            condition_on_previous_text=False,
         )
         # Normalise to the `chunks` shape the rest of the pipeline expects.
         if "segments" in result and "chunks" not in result:
@@ -480,7 +556,16 @@ class PyTorchWhisperBackend(ASRBackend):
         if self._pipe is None:
             raise RuntimeError("Loaded TTS model has no `_asr_pipe` attribute.")
 
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,
+    ) -> dict:
+        # `language` is accepted for signature parity but ignored — the
+        # HuggingFace transformers Whisper pipeline doesn't expose
+        # initial_prompt or condition_on_previous_text.
         import soundfile as sf
         import torch
         self._ensure_pipe()
@@ -534,7 +619,13 @@ class NeMoASRBackend(ASRBackend):
             model_name=self._model_name
         )
 
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,  # Parakeet is English-only — ignored
+    ) -> dict:
         self._ensure_model()
         logger.info(
             "NeMo Parakeet transcribing %s (word_timestamps=%s)",
@@ -618,7 +709,13 @@ class MoonshineASRBackend(ASRBackend):
             "uv pip install moonshine-onnx  (or moonshine-voice)"
         )
 
-    def transcribe(self, audio_path: str, *, word_timestamps: bool = True) -> dict:
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        word_timestamps: bool = True,
+        language: Optional[str] = None,  # Moonshine is English-only — ignored
+    ) -> dict:
         logger.info("Moonshine transcribing %s (model=%s)", audio_path, self._model_name)
         try:
             import moonshine_onnx

@@ -25,6 +25,8 @@ import type { UiSlice } from './uiSlice';
 import { createUiSlice } from './uiSlice';
 import type { DubSlice } from './dubSlice';
 import { createDubSlice } from './dubSlice';
+import type { DubMixSlice } from './dubMixSlice';
+import { createDubMixSlice } from './dubMixSlice';
 import type { GenerateSlice } from './generateSlice';
 import { createGenerateSlice } from './generateSlice';
 import type { PillSlice } from './pillSlice';
@@ -34,7 +36,7 @@ import { createVoiceSlice } from './voiceSlice';
 import type { DubSettingsSlice } from './dubSettingsSlice';
 import { createDubSettingsSlice } from './dubSettingsSlice';
 
-export type AppStore = PrefsSlice & GlossarySlice & UiSlice & DubSlice & GenerateSlice & PillSlice & VoiceSlice & DubSettingsSlice;
+export type AppStore = PrefsSlice & GlossarySlice & UiSlice & DubSlice & DubMixSlice & GenerateSlice & PillSlice & VoiceSlice & DubSettingsSlice;
 
 /**
  * `useAppStore` — single root store. Don't create siblings. Slices compose here.
@@ -50,6 +52,7 @@ export const useAppStore = create<AppStore>()(
       ...createGlossarySlice(set, get, api),
       ...createUiSlice(set, get, api),
       ...createDubSlice(set, get, api),
+      ...createDubMixSlice(set, get, api),
       ...createGenerateSlice(set, get, api),
       ...createPillSlice(set, get, api),
       ...createVoiceSlice(set, get, api),

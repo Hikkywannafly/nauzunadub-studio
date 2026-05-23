@@ -22,20 +22,59 @@ _MAX_TIMELINE_SNAPSHOTS = 5
 router = APIRouter()
 logger = logging.getLogger("omnivoice.api")
 
-# Concurrency cap cho LLM translate. Endpoint OpenAI cloud chấp 10-20 song song
-# thoải mái, nhưng LLM tự host (Ollama, LM Studio, custom proxy) thường rate-
-# limit chặt — 13 segments fire cùng lúc → 429. Mặc định 2 cho an toàn. Tăng
-# qua VIDEODUB_LLM_TRANSLATE_CONCURRENCY khi xài cloud endpoint.
-_LLM_CONCURRENCY = max(1, int(os.environ.get("VIDEODUB_LLM_TRANSLATE_CONCURRENCY", "2")))
+# Concurrency cap cho LLM translate.
+# - Cloud (OpenAI/Anthropic/proxy public) chịu được 10-20 song song.
+# - Local (Ollama/LM Studio/127.0.0.1) thường serialize 1 request/lần — quá 2-3
+#   là 429 / OOM. Auto-detect bằng base_url; user vẫn override được qua env
+#   VIDEODUB_LLM_TRANSLATE_CONCURRENCY.
+_LLM_CONCURRENCY_OVERRIDE = os.environ.get("VIDEODUB_LLM_TRANSLATE_CONCURRENCY")
 _LLM_MAX_RETRIES = max(0, int(os.environ.get("VIDEODUB_LLM_TRANSLATE_RETRIES", "4")))
 _llm_translate_sem: asyncio.Semaphore | None = None
+_llm_translate_sem_size: int = 0
+
+# Hostname fragments được xem là "local" — không nâng concurrency.
+_LOCAL_HOST_HINTS = (
+    "localhost", "127.0.0.1", "0.0.0.0", "::1",
+    "ollama", "lmstudio", "lm-studio", "host.docker.internal",
+)
+
+
+def _detect_concurrency() -> int:
+    """Pick a sane default based on whether the active LLM looks local or cloud.
+
+    Override priority: explicit env var > backend introspection > fallback 2.
+    Re-runs each call so a runtime prefs change (Settings → LLM Provider) takes
+    effect on the next translate request without server restart.
+    """
+    if _LLM_CONCURRENCY_OVERRIDE is not None:
+        try:
+            return max(1, int(_LLM_CONCURRENCY_OVERRIDE))
+        except ValueError:
+            pass
+    try:
+        from services.llm_backend import OpenAICompatBackend
+        base_url, _, _ = OpenAICompatBackend._resolved_config()
+    except Exception:
+        return 2
+    if not base_url:
+        # No base_url set → defaulting to OpenAI cloud, which handles concurrency well.
+        return 10
+    bl = base_url.lower()
+    if any(h in bl for h in _LOCAL_HOST_HINTS):
+        return 2
+    return 10
 
 
 def _get_llm_translate_sem() -> asyncio.Semaphore:
-    """Lazy-init semaphore bound to current running loop."""
-    global _llm_translate_sem
-    if _llm_translate_sem is None:
-        _llm_translate_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
+    """Lazy-init semaphore bound to current running loop.
+    Recreates the semaphore if the detected concurrency changed since last call
+    (e.g. user switched from Ollama → OpenAI in Settings).
+    """
+    global _llm_translate_sem, _llm_translate_sem_size
+    target = _detect_concurrency()
+    if _llm_translate_sem is None or target != _llm_translate_sem_size:
+        _llm_translate_sem = asyncio.Semaphore(target)
+        _llm_translate_sem_size = target
     return _llm_translate_sem
 
 

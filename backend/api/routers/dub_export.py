@@ -4,6 +4,7 @@ import time
 import uuid
 import asyncio
 import logging
+from urllib.parse import quote
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
@@ -21,6 +22,12 @@ logger = logging.getLogger("omnivoice.api")
 def _unique_stamp() -> str:
     """Return a short unique suffix like '20260415T142301-ab12cd34' for export files."""
     return f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def _content_disposition(filename: str) -> str:
+    # HTTP headers are latin-1; Unicode (e.g. Vietnamese) filenames need RFC 5987 encoding.
+    ascii_fallback = filename.encode("ascii", "replace").decode("ascii").replace("?", "_").replace('"', "_")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
 def _native_save(source: str, destination: str, display_name: str, media_type: str):
@@ -614,7 +621,7 @@ async def dub_download(
 
     return FileResponse(
         output_path, media_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+        headers={"Content-Disposition": _content_disposition(dl_name)},
     )
 
 
@@ -806,7 +813,7 @@ async def dub_download_audio(
         return _native_save(wav_path, save_path, dl_name, media_type="audio/wav")
     return FileResponse(
         wav_path, media_type="audio/wav",
-        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+        headers={"Content-Disposition": _content_disposition(dl_name)},
     )
 
 
@@ -1028,7 +1035,7 @@ async def dub_export_srt(
     return Response(
         content=srt_content,
         media_type="text/plain",
-        headers={"Content-Disposition": f'attachment; filename="subtitles_{base_name}{suffix}.srt"'},
+        headers={"Content-Disposition": _content_disposition(f"subtitles_{base_name}{suffix}.srt")},
     )
 
 def _format_vtt_time(seconds):
@@ -1070,7 +1077,7 @@ async def dub_export_vtt(
     return Response(
         content=vtt_content,
         media_type="text/vtt",
-        headers={"Content-Disposition": f'attachment; filename="subtitles_{base_name}{suffix}.vtt"'},
+        headers={"Content-Disposition": _content_disposition(f"subtitles_{base_name}{suffix}.vtt")},
     )
 
 
@@ -1102,7 +1109,7 @@ async def dub_export_segments_zip(job_id: str):
     return Response(
         content=zip_buffer.read(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="segments_{safe_name}.zip"'},
+        headers={"Content-Disposition": _content_disposition(f"segments_{safe_name}.zip")},
     )
 
 @router.get("/dub/download-mp3/{job_id}")
@@ -1190,7 +1197,7 @@ async def dub_download_mp3(
         return _native_save(mp3_path, save_path, dl_name, media_type="audio/mpeg")
     return FileResponse(
         mp3_path, media_type="audio/mpeg",
-        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+        headers={"Content-Disposition": _content_disposition(dl_name)},
     )
 
 @router.get("/dub/export-stems/{job_id}")
@@ -1229,5 +1236,5 @@ async def dub_export_stems(job_id: str, lang: str = Query(None)):
     return Response(
         content=zip_buffer.read(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="stems_{safe_name}.zip"'},
+        headers={"Content-Disposition": _content_disposition(f"stems_{safe_name}.zip")},
     )

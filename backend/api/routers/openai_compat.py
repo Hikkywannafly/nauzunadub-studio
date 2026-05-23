@@ -319,7 +319,7 @@ async def create_transcription(
         word_ts = response_format == "verbose_json"
         result = await loop.run_in_executor(
             _gpu_pool,
-            lambda: backend.transcribe(tmp_path, word_timestamps=word_ts),
+            lambda: backend.transcribe(tmp_path, word_timestamps=word_ts, language=language),
         )
 
         # Extract the full text from segments

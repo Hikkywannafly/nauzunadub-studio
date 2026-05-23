@@ -371,294 +371,18 @@ _prep_event_helper = dub_pipeline.prep_event  # alias; we keep the module-local 
 async def dub_transcribe_stream(job_id: str):
     """Stream per-chunk segments via SSE, then emit diarized final pass.
 
-    Pre-flight checks (missing job, missing audio, ASR not loaded) are emitted
-    as in-stream `error` events rather than HTTP errors, because EventSource
-    on the client can't read non-2xx response bodies — a 503 there surfaces
-    as an opaque "network error" instead of the actionable message we want.
+    Thin HTTP wrapper — the actual ASR / diarize / speaker-clone work lives
+    in `services.dub_pipeline.transcribe_pipeline` so it can be exercised
+    from tests, the Tools page, and the headless CLI without spinning up
+    FastAPI. Pre-flight errors are emitted as in-stream `error` events
+    (EventSource can't read non-2xx bodies).
     """
-    job = _get_job(job_id)
-
-    preflight_error: Optional[str] = None
-    asr_audio_target: Optional[str] = None
-    _asr_backend = None
-    scene_cuts: list = []
-
-    if not job:
-        preflight_error = "Job not found. It may have been cleaned up or was never created."
-    else:
-        _model = await get_model()
-        asr_audio_target = job.get("vocals_path")
-        if not asr_audio_target or not os.path.exists(asr_audio_target):
-            asr_audio_target = job.get("audio_path")
-        if not asr_audio_target or not os.path.exists(asr_audio_target):
-            preflight_error = "No audio available for transcription."
-        else:
-            from services.asr_backend import get_active_asr_backend
-            try:
-                _asr_backend = get_active_asr_backend(asr_pipe=getattr(_model, "_asr_pipe", None))
-                if _asr_backend.id == "pytorch-whisper" and getattr(_model, "_asr_pipe", None) is None:
-                    preflight_error = (
-                        "No ASR backend is ready. Install WhisperX/faster-whisper/MLX Whisper "
-                        "or set OMNIVOICE_PRELOAD_TTS_ASR=1 before launch to use the PyTorch fallback."
-                    )
-            except Exception as e:
-                preflight_error = f"ASR backend initialization failed: {e}"
-            scene_cuts = job.get("scene_cuts") or []
-
-    async def gen():
-        if preflight_error:
-            yield _sse_event("error", {"detail": preflight_error})
-            return
-        import math
-        import tempfile
-        loop = asyncio.get_running_loop()
-
-        def _load():
-            audio_np, sr = sf.read(asr_audio_target, dtype="float32")
-            if audio_np.ndim > 1:
-                audio_np = audio_np.mean(axis=1)
-            return audio_np, sr
-
-        try:
-            audio_np, sr = await loop.run_in_executor(_cpu_pool, _load)
-        except Exception as e:
-            yield _sse_event("error", {"detail": f"audio load failed: {e}"})
-            return
-
-        total = float(len(audio_np)) / float(sr) if sr else 0.0
-        chunks_n = max(1, int(math.ceil(total / TRANSCRIBE_CHUNK_S))) if total > 0 else 1
-        yield _sse_event("start", {"duration": total, "chunks": chunks_n, "chunk_s": TRANSCRIBE_CHUNK_S})
-
-        # Free VRAM: move TTS model to CPU so WhisperX + VAD can fit.
-        # Only offloads when free GPU memory is < 4 GB (e.g. laptop GPUs).
-        await loop.run_in_executor(_cpu_pool, offload_tts_for_asr)
-
-        all_segments: list[dict] = []
-        detected_lang = None
-        next_seg_id = 0
-        chunk_errors: list[str] = []
-
-        for i in range(chunks_n):
-            if job.get("aborted"):
-                yield _sse_event("aborted", {})
-                return
-            t0 = i * TRANSCRIBE_CHUNK_S
-            t1 = min(total, t0 + TRANSCRIBE_CHUNK_S)
-            s_from = int(t0 * sr)
-            s_to = int(t1 * sr)
-            chunk_arr = audio_np[s_from:s_to]
-            if len(chunk_arr) == 0:
-                continue
-
-            def _transcribe_chunk(arr=chunk_arr, offset=t0, local_sr=sr):
-                # Route through the active backend (WhisperX by default).
-                # Backends all take a file path, so write the chunk first.
-                try:
-                    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                    tmp.close()
-                    try:
-                        sf.write(tmp.name, arr, local_sr)
-                        r = _asr_backend.transcribe(tmp.name, word_timestamps=True)
-                    finally:
-                        try: os.remove(tmp.name)
-                        except OSError: pass
-                    shifted = []
-                    for c in r.get("chunks", []) or []:
-                        ts = c.get("timestamp", (0.0, 0.0)) or (0.0, 0.0)
-                        a0 = (ts[0] if ts[0] is not None else 0.0) + offset
-                        a1 = (ts[1] if ts[1] is not None else 0.0) + offset
-                        shifted.append({"text": c.get("text", ""), "timestamp": (a0, a1)})
-                    return {"chunks": shifted, "language": r.get("language")}
-                except Exception as e:
-                    logger.exception("chunk transcribe failed (backend=%s)", _asr_backend.id)
-                    return {"chunks": [], "language": None, "error": str(e)}
-
-            try:
-                # wait_for in a loop to yield pings so the EventSource connection doesn't drop
-                fut = loop.run_in_executor(_gpu_pool, _transcribe_chunk)
-                waited = 0.0
-                part = None
-                while True:
-                    done, pending = await asyncio.wait([fut], timeout=5.0)
-                    if done:
-                        part = done.pop().result()
-                        break
-                    yield _sse_event("ping", {})
-                    waited += 5.0
-                    if waited >= TRANSCRIBE_CHUNK_TIMEOUT_S:
-                        # Re-raise TimeoutError if we exceed the overall limit
-                        raise asyncio.TimeoutError()
-            except asyncio.TimeoutError:
-                logger.error(
-                    "Transcribe chunk %d/%d timed out after %.0fs (job=%s)",
-                    i + 1, chunks_n, TRANSCRIBE_CHUNK_TIMEOUT_S, job_id,
-                )
-                part = {
-                    "chunks": [], "language": None,
-                    "error": f"Chunk {i+1} timed out after {TRANSCRIBE_CHUNK_TIMEOUT_S:.0f}s — "
-                             f"ASR backend may be stuck. Try restarting the server.",
-                }
-            if part.get("error"):
-                chunk_errors.append(part["error"])
-                logger.warning("Chunk %d/%d error: %s", i + 1, chunks_n, part["error"])
-            if detected_lang is None and part.get("language"):
-                detected_lang = part["language"]
-            chunk_segs = segment_transcript(part, duration=t1, scene_cuts=scene_cuts)
-            chunk_segs = assign_speakers_heuristic(chunk_segs)
-            for s in chunk_segs:
-                s["id"] = f"s{next_seg_id:05x}"
-                s["text_original"] = s.get("text", "")
-                next_seg_id += 1
-            all_segments.extend(chunk_segs)
-            yield _sse_event("segments", {
-                "chunk": i, "total_chunks": chunks_n,
-                "segments": chunk_segs,
-                "progress": (i + 1) / chunks_n,
-                "error": part.get("error"),
-            })
-
-        if job.get("aborted"):
-            yield _sse_event("aborted", {})
-            return
-
-        # Empty-transcription guard: if every chunk came back with zero
-        # segments we can't proceed to diarization/clone extraction. Emit an
-        # actionable error so the UI can surface a Retry instead of silently
-        # landing in an empty editor. Commonly caused by a first-run model
-        # download failure, a PyTorch 2.6 weights_only regression inside
-        # whisperx's VAD load, or an unsupported audio format.
-        if not all_segments:
-            # Deduplicate while preserving order so one root cause doesn't
-            # repeat N times in the UI toast.
-            seen = set()
-            uniq: list[str] = []
-            for msg in chunk_errors:
-                if msg and msg not in seen:
-                    seen.add(msg)
-                    uniq.append(msg)
-            if uniq:
-                detail = "Transcription produced no segments. " + " | ".join(uniq[:3])
-            else:
-                detail = (
-                    "Transcription produced no segments. The audio may be silent, "
-                    "too short, or in an unsupported format. Try re-uploading or "
-                    "check that the source has an audible speech track."
-                )
-            logger.error("transcribe yielded 0 segments (job=%s): %s", job_id, detail)
-            yield _sse_event("error", {"detail": detail, "retryable": True})
-            yield _sse_event("done", {})
-            return
-
-        def _diarize():
-            """Returns (segments, warning_or_None).
-
-            Warning is set when we silently fell back to the silence-gap
-            heuristic (no HF_TOKEN, model unavailable, or pyannote raised).
-            """
-            diar_pipe = get_diarization_pipeline()
-            if not diar_pipe:
-                if not os.environ.get("HF_TOKEN"):
-                    reason = (
-                        "Speaker diarization is disabled because no HF_TOKEN is set. "
-                        "To detect multiple speakers, set HF_TOKEN and accept the "
-                        "pyannote/speaker-diarization-3.1 license at huggingface.co. "
-                        "Falling back to a silence-gap heuristic — turns with no audible "
-                        "pause between them will be merged into one speaker."
-                    )
-                else:
-                    reason = (
-                        "Speaker diarization model failed to load — see backend logs for "
-                        "the underlying error (often: pyannote license not accepted on "
-                        "Hugging Face, or download blocked by network). Falling back to "
-                        "a silence-gap heuristic; rapid speaker turns may be merged."
-                    )
-                return assign_speakers_heuristic(all_segments), reason
-            try:
-                diar = diar_pipe(asr_audio_target)
-                return assign_speakers_from_diarization(all_segments, diar), None
-            except Exception as e:
-                logger.error(f"Diarization failed: {e}")
-                return (
-                    assign_speakers_heuristic(all_segments),
-                    f"Speaker diarization crashed mid-run ({type(e).__name__}); "
-                    "falling back to a silence-gap heuristic. Rapid speaker turns "
-                    "may be merged."
-                )
-
-        fut_diar = loop.run_in_executor(_gpu_pool, _diarize)
-        final_segs = None
-        diar_warning = None
-        while True:
-            done, pending = await asyncio.wait([fut_diar], timeout=5.0)
-            if done:
-                final_segs, diar_warning = done.pop().result()
-                break
-            yield _sse_event("ping", {})
-        if diar_warning:
-            logger.warning("diarization fallback: %s", diar_warning)
-            yield _sse_event("warning", {"detail": diar_warning, "source": "diarization"})
-
-        job["segments"] = final_segs
-
-        # Auto-speaker-clone: sample each detected speaker's voice from the
-        # Demucs-isolated vocals track and assign `auto:speaker_N` as the
-        # default profile for their segments. This is what lets a user add a
-        # new target language and have the ORIGINAL speaker speak it — the
-        # central pro-grade dubbing promise.
-        try:
-            from services.speaker_clone import extract_speaker_clones, auto_profile_id
-            vocals_for_clone = job.get("vocals_path") or asr_audio_target
-            fut_clones = loop.run_in_executor(
-                _cpu_pool, extract_speaker_clones,
-                vocals_for_clone, final_segs, os.path.dirname(vocals_for_clone),
-            )
-            clones = None
-            while True:
-                done, pending = await asyncio.wait([fut_clones], timeout=5.0)
-                if done:
-                    clones = done.pop().result()
-                    break
-                yield _sse_event("ping", {})
-            if clones:
-                job["speaker_clones"] = clones
-                # Default each segment's profile_id to its speaker's auto-clone,
-                # but only if the user hasn't already assigned something.
-                for s in final_segs:
-                    if s.get("profile_id"):
-                        continue
-                    spk = s.get("speaker_id") or "Speaker 1"
-                    if spk in clones:
-                        s["profile_id"] = auto_profile_id(spk)
-        except Exception as e:
-            logger.warning("speaker_clone extraction skipped: %s", e)
-
-        job["source_lang"] = ((detected_lang or "en").split("_")[0][:2] or "en").lower()
-        job["full_transcript"] = " ".join(s.get("text", "") for s in final_segs)
-        _save_job(job_id, job)
-
-        # Restore TTS model to GPU now that ASR is done
-        if _asr_backend:
-            try:
-                _asr_backend.unload()
-            except Exception as e:
-                logger.warning("Failed to unload ASR backend: %s", e)
-
-        await loop.run_in_executor(_cpu_pool, restore_tts_after_asr)
-
-        if torch.backends.mps.is_available():
-            try: torch.mps.empty_cache()
-            except Exception: pass
-
-        yield _sse_event("final", {
-            "segments": final_segs,
-            "source_lang": job["source_lang"],
-            "full_transcript": job["full_transcript"],
-            "speaker_clones": job.get("speaker_clones", {}),
-        })
-        yield _sse_event("done", {})
-
     return StreamingResponse(
-        gen(),
+        dub_pipeline.transcribe_pipeline(
+            job_id,
+            chunk_seconds=TRANSCRIBE_CHUNK_S,
+            chunk_timeout_seconds=TRANSCRIBE_CHUNK_TIMEOUT_S,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -695,7 +419,14 @@ async def dub_transcribe(job_id: str):
         try:
             try:
                 logger.info("Transcribing full audio via %s ...", _asr.id)
-                result = _asr.transcribe(asr_audio_target, word_timestamps=True)
+                # Use the UI-selected source language as a hint so CJK runs
+                # get the punctuation-recovery prompt on the first try. None
+                # falls through to the backend's own auto-detect path.
+                result = _asr.transcribe(
+                    asr_audio_target,
+                    word_timestamps=True,
+                    language=job.get("source_lang"),
+                )
                 detected_lang = result.get("language")
             except Exception as e:
                 logger.error("ASR backend %s failed: %s", _asr.id, e)

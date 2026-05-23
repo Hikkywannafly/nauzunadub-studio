@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import math
 import time
 import asyncio
 import torch
@@ -18,6 +19,11 @@ from services.rvc import apply_rvc, is_enabled as rvc_is_enabled
 from services.incremental import segment_fingerprint
 from services.watermark import embed_watermark
 from api.routers.dub_core import _get_job, _save_job
+from services.dub_pipeline import (
+    register_proc as _register_proc,
+    unregister_proc as _unregister_proc,
+    get_job_lock as _get_job_lock,
+)
 
 logger = logging.getLogger("omnivoice.dub")
 
@@ -107,6 +113,34 @@ async def dub_generate(job_id: str, req: DubRequest):
         logger.warning("Voice Settings overlay skipped: %s", _voice_e)
 
     async def _stream(task_id):
+        # Register this coroutine's task in _active_procs so /dub/abort can
+        # cancel it mid-segment (a stuck CUDA kernel won't unblock immediately,
+        # but the loop will exit at the next await point). Also acquire the
+        # per-job lock so Translate / segment-sync writers can't race the
+        # generation pass on `job["segments"]`.
+        _self_task = asyncio.current_task()
+        if _self_task is not None:
+            _register_proc(job_id, _self_task)
+        _job_lock = _get_job_lock(job_id)
+        lock_held = False
+        try:
+            await _job_lock.acquire()
+            lock_held = True
+        except RuntimeError:
+            pass
+        try:
+            async for _chunk in _stream_body(task_id):
+                yield _chunk
+        finally:
+            if lock_held:
+                try:
+                    _job_lock.release()
+                except RuntimeError:
+                    pass
+            if _self_task is not None:
+                _unregister_proc(job_id, _self_task)
+
+    async def _stream_body(task_id):
         total = len(req.segments)
         all_segment_wavs = []
         sync_scores = []
@@ -414,16 +448,21 @@ async def dub_generate(job_id: str, req: DubRequest):
         for (_si, _wav, _sr, _sid, _fp, _nstep) in _pending_seg_writes:
             seg_wav_path = os.path.join(DUB_DIR, job_id, f"seg_{_si}.wav")
             try:
-                # Apply invisible watermark before writing to disk
-                _wav = embed_watermark(_wav, _sr)
+                # Watermark is applied ONCE on the final assembled track below.
+                # Embedding it per-segment too compounds the neural artifact and
+                # made detection slightly less reliable on the assembled mix.
+                # Per-seg WAVs serve as raw cache for partial regen + preview.
                 torchaudio.save(seg_wav_path, _wav, _sr)
             except Exception as e:
                 logger.warning("deferred seg write failed for %s: %s", _sid, e)
             if _fp is not None:
                 hashes[_sid] = _fp
             quality_map[_sid] = _nstep
-        # Single job flush instead of one per 8 segments.
-        _save_job(job_id, job)
+        # Partial save: only bump segments_count / tracks columns. The full
+        # job_data blob already got persisted at the end of ingest + after each
+        # high-level state change; rewriting it here just for the fingerprint
+        # dict is the "fat blob" problem flagged in the architecture review.
+        _save_job(job_id, job, partial=True)
         _t_diskw = time.perf_counter() - _t_diskw_0
 
         sr = _model.sampling_rate
@@ -474,15 +513,56 @@ async def dub_generate(job_id: str, req: DubRequest):
         ]
 
         def _resample_to(x, target_samples):
-            """Linear-interp resample. Slight pitch shift; acceptable ≤1.15×,
-            audible ≥1.3×. Used by both DOWN-fit (slot_fit=time_stretch) and
-            UP-fill (fill_slot_mode=stretch_up)."""
-            return torch.nn.functional.interpolate(
-                x.unsqueeze(0),
-                size=max(1, target_samples),
-                mode='linear',
-                align_corners=False,
-            ).squeeze(0)
+            """Time-stretch via phase-vocoder, preserving pitch.
+
+            Old impl used torch.nn.functional.interpolate which is fast but
+            shifts pitch by the stretch ratio — audible above ~1.15×. The
+            phase-vocoder STFT path keeps formants in place so a 1.25× squeeze
+            doesn't make the speaker sound chipmunked.
+
+            Falls back to linear interpolation if torchaudio.functional or the
+            STFT op throws (very short clips, exotic dtypes) so we never lose
+            the segment in the mix.
+            """
+            cur = x.shape[-1]
+            if cur <= 0 or target_samples <= 0:
+                return x
+            ratio = cur / float(target_samples)  # >1 = compress, <1 = expand
+            if abs(ratio - 1.0) < 1e-3:
+                return x
+            try:
+                import torchaudio.functional as AF
+                n_fft = 1024
+                hop = n_fft // 4
+                # STFT expects (..., time). x is (channels, samples).
+                window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+                spec = torch.stft(
+                    x, n_fft=n_fft, hop_length=hop, window=window,
+                    return_complex=True, center=True,
+                )
+                phase_advance = torch.linspace(
+                    0, math.pi * hop, spec.shape[-2], device=spec.device, dtype=x.dtype,
+                )[..., None]
+                stretched = AF.phase_vocoder(spec, rate=ratio, phase_advance=phase_advance)
+                out = torch.istft(
+                    stretched, n_fft=n_fft, hop_length=hop, window=window,
+                    length=target_samples,
+                )
+                # phase_vocoder + istft sometimes amplifies; renormalise to
+                # match input peak so per-seg gain stays meaningful.
+                peak_in = x.abs().max()
+                peak_out = out.abs().max()
+                if peak_out > 0 and peak_in > 0:
+                    out = out * (peak_in / peak_out).clamp(max=2.0)
+                return out
+            except Exception as err:
+                logger.debug("phase-vocoder failed, falling back to linear: %s", err)
+                return torch.nn.functional.interpolate(
+                    x.unsqueeze(0),
+                    size=max(1, target_samples),
+                    mode='linear',
+                    align_corners=False,
+                ).squeeze(0)
 
         write_cursor = 0  # last sample written across all segs — sequential mode push
         for i, (seg_start, seg_end, wav, _) in enumerate(all_segment_wavs):

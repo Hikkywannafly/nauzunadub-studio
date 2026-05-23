@@ -63,15 +63,9 @@ export interface DubSlice {
   dubLang: string;
   dubLangCode: string;
 
-  // ── Generation options ────────────────────────────────────────────────
-  dubInstruct: string;
-  preserveBg: boolean;
-  defaultTrack: string;
-  exportTracks: Record<string, boolean>;
-
-  // Segment ids most recently rendered at num_step=8 (preview quality).
-  // The client re-renders these at full quality before final export.
-  previewSegIds: string[];
+  // Mix-time / generation knobs (dubInstruct, preserveBg, defaultTrack,
+  // exportTracks, previewSegIds) live in dubMixSlice now — they had a
+  // different lifecycle (user-configurable + persisted) than pipeline state.
 
   // Per-speaker auto-clones extracted from the source video's vocals. Keys
   // are speaker_id (e.g. "Speaker 1"), values are {ref_audio, ref_text,
@@ -99,11 +93,6 @@ export interface DubSlice {
   setDubTracks: (v: Updater<string[]>) => void;
   setDubLang: (v: Updater<string>) => void;
   setDubLangCode: (v: Updater<string>) => void;
-  setDubInstruct: (v: Updater<string>) => void;
-  setPreserveBg: (v: Updater<boolean>) => void;
-  setDefaultTrack: (v: Updater<string>) => void;
-  setExportTracks: (v: Updater<Record<string, boolean>>) => void;
-  setPreviewSegIds: (v: Updater<string[]>) => void;
   setSpeakerClones: (v: Updater<DubSlice['speakerClones']>) => void;
 
   /** Reset every pipeline field back to idle defaults. */
@@ -114,8 +103,7 @@ const INITIAL: Omit<DubSlice,
   | 'setDubJobId' | 'setDubStep' | 'setDubTaskId' | 'setDubPrepStage'
   | 'setDubProgress' | 'setDubError' | 'setIsTranslating' | 'setDubSegments'
   | 'setDubTranscript' | 'setDubFilename' | 'setDubDuration' | 'setDubTracks'
-  | 'setDubLang' | 'setDubLangCode' | 'setDubInstruct' | 'setPreserveBg'
-  | 'setDefaultTrack' | 'setExportTracks' | 'setPreviewSegIds' | 'setSpeakerClones' | 'resetDubState'
+  | 'setDubLang' | 'setDubLangCode' | 'setSpeakerClones' | 'resetDubState'
 > = {
   dubJobId: null,
   dubStep: 'idle',
@@ -131,11 +119,6 @@ const INITIAL: Omit<DubSlice,
   dubTracks: [],
   dubLang: 'Auto',
   dubLangCode: 'en',
-  dubInstruct: '',
-  preserveBg: true,
-  defaultTrack: 'original',
-  exportTracks: { original: true },
-  previewSegIds: [],
   speakerClones: {},
 };
 
@@ -156,11 +139,6 @@ export const createDubSlice: StateCreator<DubSlice, [], [], DubSlice> = (set, ge
   setDubTracks:    (v) => set((s) => ({ dubTracks:    resolve(v, s.dubTracks) })),
   setDubLang:      (v) => set((s) => ({ dubLang:      resolve(v, s.dubLang) })),
   setDubLangCode:  (v) => set((s) => ({ dubLangCode:  resolve(v, s.dubLangCode) })),
-  setDubInstruct:  (v) => set((s) => ({ dubInstruct:  resolve(v, s.dubInstruct) })),
-  setPreserveBg:   (v) => set((s) => ({ preserveBg:   resolve(v, s.preserveBg) })),
-  setDefaultTrack: (v) => set((s) => ({ defaultTrack: resolve(v, s.defaultTrack) })),
-  setExportTracks: (v) => set((s) => ({ exportTracks: resolve(v, s.exportTracks) })),
-  setPreviewSegIds:(v) => set((s) => ({ previewSegIds:resolve(v, s.previewSegIds) })),
   setSpeakerClones:(v) => set((s) => ({ speakerClones: resolve(v, s.speakerClones) })),
 
   resetDubState: () => {

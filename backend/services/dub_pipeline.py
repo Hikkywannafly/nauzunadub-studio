@@ -35,6 +35,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import OrderedDict
 from typing import AsyncIterator, Optional
 
 import soundfile as sf
@@ -52,13 +53,46 @@ logger = logging.getLogger("omnivoice.dub_pipeline")
 # These used to live in dub_core.py. The router now re-exports them for
 # backward compat during the transition.
 
-_dub_jobs: dict[str, dict] = {}
+# OrderedDict to support LRU eviction — long-running servers visit many jobs
+# and we don't want unbounded RAM growth. Cap is overridable via env.
+_DUB_JOBS_CAP = max(8, int(os.environ.get("VIDEODUB_JOB_CACHE_CAP", "32")))
+_dub_jobs: "OrderedDict[str, dict]" = OrderedDict()
 _dub_jobs_lock = threading.Lock()
 _active_procs: dict[str, list] = {}
 _active_procs_lock = threading.Lock()
 
+# Per-job asyncio lock — serialises writers (translate, generate, segment sync)
+# on the same job_id so two concurrent ops can't silently overwrite each other.
+# Lazy-created on first request because asyncio.Lock binds to the running loop.
+_job_locks: dict[str, asyncio.Lock] = {}
+_job_locks_lock = threading.Lock()
+
 _DUB_DIR_REAL = os.path.realpath(DUB_DIR)
 _HASH_BUF_SIZE = 1 << 18  # 256 KB chunks for hashing
+
+
+def get_job_lock(job_id: str) -> asyncio.Lock:
+    """Return the asyncio.Lock guarding writes to one job. Created on demand."""
+    with _job_locks_lock:
+        lock = _job_locks.get(job_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _job_locks[job_id] = lock
+        return lock
+
+
+def _evict_lru_if_needed() -> None:
+    """Drop oldest jobs from the in-memory cache until under the cap.
+    Caller must hold _dub_jobs_lock. SQLite blob is the source of truth, so
+    eviction is lossless — next get_job() rehydrates from disk.
+    """
+    while len(_dub_jobs) > _DUB_JOBS_CAP:
+        evicted_id, _ = _dub_jobs.popitem(last=False)
+        logger.debug("LRU-evicted job %s from in-memory cache (cap=%d)", evicted_id, _DUB_JOBS_CAP)
+        # Drop the lock too — if the evicted job becomes active again later,
+        # get_job_lock will mint a fresh one.
+        with _job_locks_lock:
+            _job_locks.pop(evicted_id, None)
 
 
 # ── Pure helpers ────────────────────────────────────────────────────────────
@@ -139,7 +173,12 @@ def find_cached_job(content_hash: str, exclude_job_id: str) -> Optional[dict]:
 
 
 def register_proc(job_id: str, proc) -> None:
-    """Track an in-flight subprocess so /dub/abort can kill it."""
+    """Track an in-flight subprocess OR asyncio.Task so /dub/abort can kill it.
+
+    Accepts both `asyncio.subprocess.Process` (ffmpeg / demucs / yt-dlp) and
+    `asyncio.Task` (the TTS generation coroutine). `kill_job_procs` discriminates
+    by the presence of a `returncode` attribute.
+    """
     with _active_procs_lock:
         _active_procs.setdefault(job_id, []).append(proc)
 
@@ -154,17 +193,26 @@ def unregister_proc(job_id: str, proc) -> None:
 
 
 def kill_job_procs(job_id: str) -> None:
-    """Kill every subprocess still running under a given job id. Idempotent."""
+    """Kill every subprocess + cancel every asyncio.Task under a given job id.
+    Idempotent. Subprocesses get SIGKILL; tasks get .cancel() so the coroutine
+    raises CancelledError at its next await point.
+    """
     with _active_procs_lock:
-        procs = list(_active_procs.get(job_id, []))
-    for proc in procs:
+        items = list(_active_procs.get(job_id, []))
+    for item in items:
         try:
-            if proc.returncode is None:
-                proc.kill()
+            if hasattr(item, "returncode"):
+                # asyncio.subprocess.Process
+                if item.returncode is None:
+                    item.kill()
+            elif hasattr(item, "cancel"):
+                # asyncio.Task — cancel the running coroutine
+                if not item.done():
+                    item.cancel()
         except ProcessLookupError:
             pass
         except Exception as e:
-            logger.warning("Failed to kill subprocess for %s: %s", job_id, e)
+            logger.warning("Failed to kill/cancel item for %s: %s", job_id, e)
     with _active_procs_lock:
         _active_procs.pop(job_id, None)
 
@@ -180,9 +228,11 @@ def has_active_procs(job_id: str) -> bool:
 def get_job(job_id: str) -> Optional[dict]:
     """Look up a job. Checks the in-memory cache first, then falls back to
     `dub_history.job_data` so saved projects still resolve after restart.
+    Touching a cached job marks it as most-recently-used (LRU bump).
     """
     with _dub_jobs_lock:
         if job_id in _dub_jobs:
+            _dub_jobs.move_to_end(job_id)
             return _dub_jobs[job_id]
     with db_conn() as conn:
         row = conn.execute("SELECT job_data FROM dub_history WHERE id=?", (job_id,)).fetchone()
@@ -191,6 +241,8 @@ def get_job(job_id: str) -> Optional[dict]:
             job = json.loads(row["job_data"])
             with _dub_jobs_lock:
                 _dub_jobs[job_id] = job
+                _dub_jobs.move_to_end(job_id)
+                _evict_lru_if_needed()
             return job
         except json.JSONDecodeError as e:
             logger.error("Failed to decode dub_history.job_data for %s: %s", job_id, e)
@@ -201,36 +253,60 @@ def put_job(job_id: str, job: dict) -> None:
     """Insert / replace the in-memory job record. Does NOT persist."""
     with _dub_jobs_lock:
         _dub_jobs[job_id] = job
+        _dub_jobs.move_to_end(job_id)
+        _evict_lru_if_needed()
 
 
-def save_job(job_id: str, job: dict, filename: str = "", duration: float = 0.0, content_hash: str = "") -> None:
-    """Persist dub job state to SQLite so it survives restarts. Uses UPSERT
-    on `id` so repeated saves in a session keep the latest snapshot.
+def save_job(
+    job_id: str,
+    job: dict,
+    filename: str = "",
+    duration: float = 0.0,
+    content_hash: str = "",
+    *,
+    partial: bool = False,
+) -> None:
+    """Persist dub job state to SQLite so it survives restarts. UPSERTs on `id`.
+
+    `partial=True` skips the full `job_data` JSON re-serialize when the caller
+    only wants to bump lightweight columns (segments_count / tracks / content
+    fingerprints already in-memory). Use for hot per-segment writes during the
+    TTS batch flush; the in-memory dict still holds the canonical state and
+    the next non-partial save will flush the full blob.
     """
     try:
         segments = job.get("segments") or []
         tracks = list((job.get("dubbed_tracks") or {}).keys())
         with db_conn() as conn:
-            conn.execute(
-                """INSERT INTO dub_history
-                   (id, filename, duration, segments_count, language, language_code, tracks, job_data, content_hash, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     filename=excluded.filename,
-                     duration=excluded.duration,
-                     segments_count=excluded.segments_count,
-                     tracks=excluded.tracks,
-                     job_data=excluded.job_data,
-                     content_hash=CASE WHEN excluded.content_hash != '' THEN excluded.content_hash ELSE dub_history.content_hash END""",
-                (job_id, filename or job.get("filename", ""),
-                 duration or job.get("duration", 0.0),
-                 len(segments), job.get("language", ""), job.get("language_code", ""),
-                 json.dumps(tracks), json.dumps(job, default=str), content_hash or "", time.time()),
-            )
+            if partial:
+                conn.execute(
+                    """UPDATE dub_history
+                       SET segments_count=?, tracks=?
+                       WHERE id=?""",
+                    (len(segments), json.dumps(tracks), job_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO dub_history
+                       (id, filename, duration, segments_count, language, language_code, tracks, job_data, content_hash, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         filename=excluded.filename,
+                         duration=excluded.duration,
+                         segments_count=excluded.segments_count,
+                         tracks=excluded.tracks,
+                         job_data=excluded.job_data,
+                         content_hash=CASE WHEN excluded.content_hash != '' THEN excluded.content_hash ELSE dub_history.content_hash END""",
+                    (job_id, filename or job.get("filename", ""),
+                     duration or job.get("duration", 0.0),
+                     len(segments), job.get("language", ""), job.get("language_code", ""),
+                     json.dumps(tracks), json.dumps(job, default=str), content_hash or "", time.time()),
+                )
     except Exception as e:
         logger.error("Failed to persist dub job %s: %s", job_id, e)
         return
-    event_bus.emit("dub_history", {"action": "saved", "id": job_id})
+    if not partial:
+        event_bus.emit("dub_history", {"action": "saved", "id": job_id})
 
 
 # ── Ingest pipeline (download → extract → demucs → scene → thumb) ──────────
@@ -630,3 +706,278 @@ async def ingest_pipeline(
     finally:
         with _active_procs_lock:
             _active_procs.pop(job_id, None)
+
+
+# ── Transcribe pipeline (chunked ASR → diarize → speaker clone) ────────────
+
+
+def _build_transcribe_preflight(job_id: str):
+    """Resolve everything needed for the transcribe stream OR return an error
+    string. Returns (job, asr_audio_target, asr_backend, scene_cuts, error).
+    Pulled out of the router so it can be unit-tested.
+    """
+    job = get_job(job_id)
+    if not job:
+        return None, None, None, [], "Job not found. It may have been cleaned up or was never created."
+    asr_audio_target = job.get("vocals_path")
+    if not asr_audio_target or not os.path.exists(asr_audio_target):
+        asr_audio_target = job.get("audio_path")
+    if not asr_audio_target or not os.path.exists(asr_audio_target):
+        return job, None, None, [], "No audio available for transcription."
+
+    from services.asr_backend import get_active_asr_backend
+    from services.model_manager import get_model
+    try:
+        # get_model is async; if the caller wants this fully sync, set asr_pipe=None.
+        # We don't actually need the pipe for non-pytorch backends.
+        backend = get_active_asr_backend(asr_pipe=None)
+        if backend.id == "pytorch-whisper":
+            return job, asr_audio_target, None, job.get("scene_cuts") or [], (
+                "No ASR backend is ready. Install WhisperX/faster-whisper/MLX Whisper "
+                "or set OMNIVOICE_PRELOAD_TTS_ASR=1 before launch to use the PyTorch fallback."
+            )
+    except Exception as e:
+        return job, asr_audio_target, None, job.get("scene_cuts") or [], f"ASR backend initialization failed: {e}"
+
+    return job, asr_audio_target, backend, job.get("scene_cuts") or [], None
+
+
+async def transcribe_pipeline(
+    job_id: str,
+    *,
+    chunk_seconds: float = 30.0,
+    chunk_timeout_seconds: float = 120.0,
+):
+    """Async generator: stream SSE events for the transcribe-then-diarize flow.
+
+    Extracted from `dub_core.dub_transcribe_stream` so the router stays thin
+    (HTTP plumbing only) and the pipeline can be exercised from tests / CLI.
+
+    Yields bytes ready to push into a StreamingResponse.
+    """
+    import math
+    import tempfile
+    from services.model_manager import get_model, offload_tts_for_asr, restore_tts_after_asr, get_diarization_pipeline, _gpu_pool, _cpu_pool
+    from services.segmentation import segment_transcript, assign_speakers_from_diarization, assign_speakers_heuristic
+    import torch
+
+    # Preflight: resolve job + audio + backend, but also re-resolve the asr_pipe
+    # from the loaded model (so PyTorch fallback works when preloaded).
+    job, asr_audio_target, _asr_backend, scene_cuts, preflight_error = _build_transcribe_preflight(job_id)
+    if not preflight_error and job is not None:
+        try:
+            _model = await get_model()
+            from services.asr_backend import get_active_asr_backend
+            _asr_backend = get_active_asr_backend(asr_pipe=getattr(_model, "_asr_pipe", None))
+        except Exception as e:
+            preflight_error = f"ASR backend initialization failed: {e}"
+
+    if preflight_error:
+        yield sse_event("error", {"detail": preflight_error})
+        return
+
+    loop = asyncio.get_running_loop()
+
+    def _load():
+        audio_np, sr = sf.read(asr_audio_target, dtype="float32")
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=1)
+        return audio_np, sr
+
+    try:
+        audio_np, sr = await loop.run_in_executor(_cpu_pool, _load)
+    except Exception as e:
+        yield sse_event("error", {"detail": f"audio load failed: {e}"})
+        return
+
+    total = float(len(audio_np)) / float(sr) if sr else 0.0
+    chunks_n = max(1, int(math.ceil(total / chunk_seconds))) if total > 0 else 1
+    yield sse_event("start", {"duration": total, "chunks": chunks_n, "chunk_s": chunk_seconds})
+
+    await loop.run_in_executor(_cpu_pool, offload_tts_for_asr)
+
+    all_segments: list[dict] = []
+    detected_lang = job.get("source_lang")
+    next_seg_id = 0
+    chunk_errors: list[str] = []
+
+    for i in range(chunks_n):
+        if job.get("aborted"):
+            yield sse_event("aborted", {})
+            return
+        t0 = i * chunk_seconds
+        t1 = min(total, t0 + chunk_seconds)
+        s_from = int(t0 * sr)
+        s_to = int(t1 * sr)
+        chunk_arr = audio_np[s_from:s_to]
+        if len(chunk_arr) == 0:
+            continue
+
+        def _transcribe_chunk(arr=chunk_arr, offset=t0, local_sr=sr, lang_hint=detected_lang):
+            try:
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.close()
+                try:
+                    sf.write(tmp.name, arr, local_sr)
+                    r = _asr_backend.transcribe(tmp.name, word_timestamps=True, language=lang_hint)
+                finally:
+                    try: os.remove(tmp.name)
+                    except OSError: pass
+                shifted = []
+                for c in r.get("chunks", []) or []:
+                    ts = c.get("timestamp", (0.0, 0.0)) or (0.0, 0.0)
+                    a0 = (ts[0] if ts[0] is not None else 0.0) + offset
+                    a1 = (ts[1] if ts[1] is not None else 0.0) + offset
+                    shifted.append({"text": c.get("text", ""), "timestamp": (a0, a1)})
+                return {"chunks": shifted, "language": r.get("language")}
+            except Exception as e:
+                logger.exception("chunk transcribe failed (backend=%s)", _asr_backend.id)
+                return {"chunks": [], "language": None, "error": str(e)}
+
+        try:
+            fut = loop.run_in_executor(_gpu_pool, _transcribe_chunk)
+            waited = 0.0
+            part = None
+            while True:
+                done, pending = await asyncio.wait([fut], timeout=5.0)
+                if done:
+                    part = done.pop().result()
+                    break
+                yield sse_event("ping", {})
+                waited += 5.0
+                if waited >= chunk_timeout_seconds:
+                    raise asyncio.TimeoutError()
+        except asyncio.TimeoutError:
+            logger.error("Transcribe chunk %d/%d timed out (job=%s)", i + 1, chunks_n, job_id)
+            part = {
+                "chunks": [], "language": None,
+                "error": f"Chunk {i+1} timed out after {chunk_timeout_seconds:.0f}s — "
+                         f"ASR backend may be stuck. Try restarting the server.",
+            }
+        if part.get("error"):
+            chunk_errors.append(part["error"])
+            logger.warning("Chunk %d/%d error: %s", i + 1, chunks_n, part["error"])
+        if detected_lang is None and part.get("language"):
+            detected_lang = part["language"]
+        chunk_segs = segment_transcript(part, duration=t1, scene_cuts=scene_cuts)
+        chunk_segs = assign_speakers_heuristic(chunk_segs)
+        for s in chunk_segs:
+            s["id"] = f"s{next_seg_id:05x}"
+            s["text_original"] = s.get("text", "")
+            next_seg_id += 1
+        all_segments.extend(chunk_segs)
+        yield sse_event("segments", {
+            "chunk": i, "total_chunks": chunks_n,
+            "segments": chunk_segs,
+            "progress": (i + 1) / chunks_n,
+            "error": part.get("error"),
+        })
+
+    if job.get("aborted"):
+        yield sse_event("aborted", {})
+        return
+
+    if not all_segments:
+        seen = set()
+        uniq: list[str] = []
+        for msg in chunk_errors:
+            if msg and msg not in seen:
+                seen.add(msg)
+                uniq.append(msg)
+        detail = (
+            "Transcription produced no segments. " + " | ".join(uniq[:3])
+            if uniq else
+            "Transcription produced no segments. The audio may be silent, too short, "
+            "or in an unsupported format. Try re-uploading or check that the source has "
+            "an audible speech track."
+        )
+        logger.error("transcribe yielded 0 segments (job=%s): %s", job_id, detail)
+        yield sse_event("error", {"detail": detail, "retryable": True})
+        yield sse_event("done", {})
+        return
+
+    def _diarize():
+        diar_pipe = get_diarization_pipeline()
+        if not diar_pipe:
+            reason = (
+                "Speaker diarization is disabled because no HF_TOKEN is set. "
+                "Falling back to a silence-gap heuristic; rapid speaker turns may be merged."
+                if not os.environ.get("HF_TOKEN") else
+                "Speaker diarization model failed to load — see backend logs. "
+                "Falling back to a silence-gap heuristic; rapid speaker turns may be merged."
+            )
+            return assign_speakers_heuristic(all_segments), reason
+        try:
+            diar = diar_pipe(asr_audio_target)
+            return assign_speakers_from_diarization(all_segments, diar), None
+        except Exception as e:
+            logger.error("Diarization failed: %s", e)
+            return (
+                assign_speakers_heuristic(all_segments),
+                f"Speaker diarization crashed mid-run ({type(e).__name__}); "
+                "falling back to a silence-gap heuristic.",
+            )
+
+    fut_diar = loop.run_in_executor(_gpu_pool, _diarize)
+    final_segs = None
+    diar_warning = None
+    while True:
+        done, pending = await asyncio.wait([fut_diar], timeout=5.0)
+        if done:
+            final_segs, diar_warning = done.pop().result()
+            break
+        yield sse_event("ping", {})
+    if diar_warning:
+        logger.warning("diarization fallback: %s", diar_warning)
+        yield sse_event("warning", {"detail": diar_warning, "source": "diarization"})
+
+    job["segments"] = final_segs
+
+    try:
+        from services.speaker_clone import extract_speaker_clones, auto_profile_id
+        vocals_for_clone = job.get("vocals_path") or asr_audio_target
+        fut_clones = loop.run_in_executor(
+            _cpu_pool, extract_speaker_clones,
+            vocals_for_clone, final_segs, os.path.dirname(vocals_for_clone),
+        )
+        clones = None
+        while True:
+            done, pending = await asyncio.wait([fut_clones], timeout=5.0)
+            if done:
+                clones = done.pop().result()
+                break
+            yield sse_event("ping", {})
+        if clones:
+            job["speaker_clones"] = clones
+            for s in final_segs:
+                if s.get("profile_id"):
+                    continue
+                spk = s.get("speaker_id") or "Speaker 1"
+                if spk in clones:
+                    s["profile_id"] = auto_profile_id(spk)
+    except Exception as e:
+        logger.warning("speaker_clone extraction skipped: %s", e)
+
+    job["source_lang"] = ((detected_lang or "en").split("_")[0][:2] or "en").lower()
+    job["full_transcript"] = " ".join(s.get("text", "") for s in final_segs)
+    save_job(job_id, job)
+
+    if _asr_backend:
+        try:
+            _asr_backend.unload()
+        except Exception as e:
+            logger.warning("Failed to unload ASR backend: %s", e)
+
+    await loop.run_in_executor(_cpu_pool, restore_tts_after_asr)
+
+    if torch.backends.mps.is_available():
+        try: torch.mps.empty_cache()
+        except Exception: pass
+
+    yield sse_event("final", {
+        "segments": final_segs,
+        "source_lang": job["source_lang"],
+        "full_transcript": job["full_transcript"],
+        "speaker_clones": job.get("speaker_clones", {}),
+    })
+    yield sse_event("done", {})
